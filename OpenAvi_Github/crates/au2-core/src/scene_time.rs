@@ -139,7 +139,7 @@ pub fn layer_frames(scene: &Scene, frame: Frame) -> Vec<Frame> {
         });
         if let Some(ctrl) = ctrl {
             let range = control_range(ctrl.source().expect("source を確認済み"));
-            let until = if range == 0 { usize::MAX } else { li + range };
+            let until = if range == 0 { usize::MAX } else { li.saturating_add(range) };
             remaps.push((until, time_control_frame(ctrl, f)));
         }
     }
@@ -213,6 +213,16 @@ mod tests {
 
     fn set(obj: &mut TimelineObject, key: &str, track: Track) {
         *obj.effects[0].param_mut(key).unwrap() = crate::ParamValue::Track(track);
+    }
+
+    #[test]
+    fn huge_range_does_not_overflow() {
+        let mut scene = Scene::new("s", crate::SceneSettings { width: 10, height: 10, length: 10, ..Default::default() });
+        let mut ctrl = TimelineObject::new_time_control(0, 9);
+        *ctrl.effects[0].param_mut("range").unwrap() = crate::ParamValue::Text("1e30".into());
+        scene.insert_object(1, ctrl);
+        scene.insert_object(2, TimelineObject::new_shape(0, 9, 0, "ffffff"));
+        assert_eq!(layer_frames(&scene, 3).len(), scene.layers.len());
     }
 
     #[test]

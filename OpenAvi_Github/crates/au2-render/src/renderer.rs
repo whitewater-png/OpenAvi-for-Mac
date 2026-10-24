@@ -644,6 +644,8 @@ impl Renderer {
         // 直前オブジェクト用: 直前に描いたスプライト
         let mut prev: Option<PrevSprite> = None;
 
+        // クリッピング元の判定にも、下の行が見ている（時間制御後の）フレームを使う
+        let frames = au2_core::scene_time::layer_frames(scene, frame);
         for (li, obj, layer_frame) in au2_core::scene_time::objects_at_remapped(scene, frame) {
             if !scene.layers[li].visible {
                 continue;
@@ -677,7 +679,7 @@ impl Renderer {
                         prev = Some(PrevSprite { uniform, tex: tex.clone(), zoom: params.zoom });
                         // --- 合成モード・クリッピング（docs/RENDER_DESIGN.md「合成モード・クリッピング」）---
                         uniform.blend = [BlendMode::of_object(obj).code(), 0, 0, 0];
-                        let is_source = blend::is_clip_source(scene, li, frame);
+                        let is_source = blend::is_clip_source(scene, li, frames.get(li + 1).copied().unwrap_or(frame));
                         let mut mask = None;
                         if !is_source && blend::clips_to_upper(scene, li, obj) {
                             // すぐ上のレイヤーにマスクになるオブジェクトが無ければ描かない

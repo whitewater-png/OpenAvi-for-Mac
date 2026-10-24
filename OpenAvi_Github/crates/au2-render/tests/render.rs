@@ -923,6 +923,29 @@ fn time_control_shows_objects_that_exist_at_the_remapped_time() {
     assert_near(px(&r.render(&s, 0, &mut NoMedia).unwrap(), 10, 10), [0, 0, 0, 255], 0, "時間制御が無ければ範囲外");
 }
 
+#[test]
+fn clipping_uses_the_remapped_time_of_the_layers_below() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(20, 20);
+    let mut ctrl = TimelineObject::new_time_control(0, 100);
+    set_param(&mut ctrl, "位置", Track::constant(55.0, 1)); // 55 フレーム目
+    s.insert_object(0, ctrl);
+    let mut mask = shape(50, 60, 2, "ffffff");
+    set_track(&mut mask, "図形", "サイズ", 10.0);
+    s.insert_object(1, mask);
+    let mut clipped = shape(50, 60, 2, "ff0000");
+    clipped.clipping = true;
+    s.insert_object(2, clipped);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 10, 10), [255, 0, 0, 255], 0, "マスクの内側は赤");
+    assert_near(px(&f, 2, 2), [0, 0, 0, 255], 0, "マスクの外は描かれない");
+    // マスクが範囲外の時刻なら、クリッピングする側は何も描かない
+    s.layers[1].objects[0].frame_start = 70;
+    s.layers[1].objects[0].frame_end = 80;
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 10, 10), [0, 0, 0, 255], 0, "マスクが無ければ何も出ない");
+}
+
 /// Root (100x100、青背景) と、40x20 の子シーン（中央に 10x10 の赤い四角、周りは透明）。
 fn project_with_child() -> au2_core::Project {
     let mut root = scene(100, 100);
@@ -971,8 +994,10 @@ fn scene_object_draws_the_other_scene_at_its_position() {
 fn recursive_scene_references_terminate() {
     let Some(mut r) = renderer() else { return };
     let mut project = project_with_child();
-    // Root → 自分自身、Scene1 → Scene2 → Scene1 の循環
-    project.scenes[0].insert_object(1, TimelineObject::new_scene(0, 9, 0));
+    // Root → 自分自身（右へずらす）、Scene1 → Scene2 → Scene1 の循環
+    let mut itself = TimelineObject::new_scene(0, 9, 0);
+    set_track(&mut itself, "標準描画", "X", 30.0);
+    project.scenes[0].insert_object(1, itself);
     project.scenes[1].insert_object(1, TimelineObject::new_scene(0, 29, 2));
     let mut scene2 = Scene::new("Scene2", SceneSettings { width: 40, height: 20, length: 30, ..Default::default() });
     scene2.insert_object(0, TimelineObject::new_scene(0, 29, 1));
@@ -981,6 +1006,8 @@ fn recursive_scene_references_terminate() {
     let f = r.render_project(&project, 0, 0, &mut NoMedia).unwrap();
     assert_near(px(&f, 50, 50), [255, 0, 0, 255], 1, "循環の外側は描かれる（Scene1 の四角）");
     assert_near(px(&f, 5, 5), [0, 0, 255, 255], 1, "背景");
+    // 自己参照は何も描かない（描いていれば、ずらした先に Root の写しの赤い四角が出る）
+    assert_near(px(&f, 80, 50), [0, 0, 255, 255], 1, "自己参照は描かれない");
 }
 
 #[test]
