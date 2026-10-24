@@ -10,7 +10,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::blend::{self, BlendMode};
-use crate::eval::{eval_draw_params, DrawParams};
+use crate::eval::{eval_draw_params, Controls, DrawParams, Homography};
+pub use crate::eval::ObjectBounds;
 use crate::gpu::Gpu;
 use crate::media::MediaSource;
 use crate::RenderError;
@@ -51,7 +52,8 @@ struct SpriteUniform {
     shape: u32,
     sides: u32,
     _pad: u32,
-    /// 拡張描画・3D・カメラ用の予約領域（頂点シェーダが使う。段階 B の「拡張描画/カメラ」担当が所有）
+    /// 拡張描画・3D・カメラ: 物体ローカル座標 → 画面座標の射影変換（頂点シェーダが使う）。
+    /// 並びは `eval::Homography::to_ext`。全て 0 なら `center` / `angle` による 2D 配置
     ext: [f32; 16],
     /// 合成モード・クリッピング用の予約領域（フラグメントシェーダが使う。段階 B の「合成/クリッピング」担当が所有）
     blend: [u32; 4],
@@ -64,16 +66,6 @@ struct ColorCorrectionUniform {
     a: [f32; 4],
     /// 彩度（倍率）
     b: [f32; 4],
-}
-
-/// 直近の描画での、オブジェクトの描画範囲（回転した矩形）。選択枠などの UI 用。
-/// 座標はシーン中心基準のピクセル（+y 下）、`half` は回転前の半サイズ。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ObjectBounds {
-    pub center: [f32; 2],
-    pub half: [f32; 2],
-    /// ラジアン（正 = 時計回り）
-    pub angle: f32,
 }
 
 struct TexEntry {
@@ -622,6 +614,8 @@ impl Renderer {
         self.bounds.clear();
         // 上のオブジェクトでクリッピング: クリッピング元は自分の順番では描かず、すぐ下のオブジェクトのマスクになる
         let mut clip_source: Option<(usize, SpriteUniform, Option<Arc<TexEntry>>)> = None;
+        // グループ制御・カメラ制御（レイヤー順に登録し、下のオブジェクトに掛ける）
+        let mut controls = Controls::new(canvas[1]);
 
         for (li, obj) in scene.objects_at(frame) {
             if !scene.layers[li].visible {
@@ -631,7 +625,7 @@ impl Renderer {
             let rel = frame - obj.frame_start;
             match obj.category() {
                 ObjectCategory::Media => {
-                    let params = eval_draw_params(obj, rel, fps);
+                    let params = controls.apply(li, obj, eval_draw_params(obj, rel, fps));
                     if params.alpha <= 0.0 {
                         continue;
                     }
@@ -649,10 +643,15 @@ impl Renderer {
                             mask = Some((mask_uniform, mask_tex));
                             uniform.blend[1] = 1;
                         }
-                        self.bounds.insert(
-                            obj.id,
-                            ObjectBounds { center: uniform.center, half: uniform.half, angle: uniform.angle },
-                        );
+                        // 裏面（裏面を表示しない）と、丸ごとカメラの後ろにあるものは描かない
+                        let h = Homography::from_ext(&uniform.ext)
+                            .unwrap_or_else(|| Homography::flat(uniform.center, uniform.angle));
+                        if (params.cull_back && h.is_back_facing()) || h.is_behind_camera(uniform.half) {
+                            continue;
+                        }
+                        if let Some(b) = ObjectBounds::project(&h, uniform.half) {
+                            self.bounds.insert(obj.id, b);
+                        }
                         if is_source {
                             clip_source = Some((li, uniform, tex));
                             continue;
@@ -691,6 +690,7 @@ impl Renderer {
                     filter_bytes.resize((offset + filter_stride) as usize, 0);
                     ops.push(Op::ColorCorrection { offset });
                 }
+                ObjectCategory::Control => controls.observe(li, obj, rel),
                 _ => {}
             }
         }
@@ -954,7 +954,7 @@ impl Renderer {
             shape: SHAPE_BOX,
             sides: 0,
             _pad: 0,
-            ext: [0.0; 16],
+            ext: p.homography().to_ext(),
             blend: [0; 4],
         };
         match src.kind {
@@ -969,6 +969,7 @@ impl Renderer {
                         u.center = [0.0, 0.0];
                         u.angle = 0.0;
                         u.half = [canvas[0] / 2.0, canvas[1] / 2.0];
+                        u.ext = [0.0; 16];
                     }
                     1 => u.shape = SHAPE_CIRCLE,
                     2 => u.shape = SHAPE_BOX,
@@ -1099,7 +1100,20 @@ impl Renderer {
                 // 揃えの位置合わせ点がオブジェクトの位置に来るよう、回転に合わせて中心をずらす
                 let (s, c) = p.angle.sin_cos();
                 let center = [p.x - (anchor[0] * c - anchor[1] * s), p.y - (anchor[0] * s + anchor[1] * c)];
-                Some((SpriteUniform { mode: 0, center, half: [w as f32 / 2.0, h as f32 / 2.0], ..base }, Some(entry)))
+                // 3D 配置（ext）でも同じ位置合わせ点がオブジェクトの位置に来るよう、回転の中心を位置合わせ点へずらす
+                // （中心は拡大前のピクセルで持つので、ラスタライズ時の拡大率で割る）
+                let zoom = p.zoom.max(1e-6);
+                let aligned = DrawParams { center: [p.center[0] + anchor[0] / zoom, p.center[1] + anchor[1] / zoom, p.center[2]], ..p };
+                Some((
+                    SpriteUniform {
+                        mode: 0,
+                        center,
+                        half: [w as f32 / 2.0, h as f32 / 2.0],
+                        ext: aligned.homography().to_ext(),
+                        ..base
+                    },
+                    Some(entry),
+                ))
             }
             // それ以外の種類は未対応（docs/RENDER_DESIGN.md 参照）
             _ => None,

@@ -603,3 +603,253 @@ fn loop_opens_the_video_before_requesting_any_frame() {
     assert_eq!(media.requested.len(), 1, "要求は 1 回だけ: {:?}", media.requested);
     assert!((media.requested[0] - 0.5).abs() < 1e-6, "要求された時刻 {}", media.requested[0]);
 }
+
+// ---- 拡張描画・カメラ制御・グループ制御（3D） ----
+//
+// 画素位置の手計算: 画面座標はシーン中心が原点。画素 (i, j) の中心は (i + 0.5 - W/2, j + 0.5 - H/2)。
+// 既定の視点は z = -1024（焦点距離 1024）。奥行き z の点は 1024 / (1024 + z) 倍に縮む。
+
+/// 標準描画を、AviUtl と同じ並びの「拡張描画」に置き換える（`params` で上書き）。
+fn extended(mut obj: TimelineObject, params: &[(&str, f64)]) -> TimelineObject {
+    obj.effects.retain(|e| e.name != "標準描画");
+    let mut d = Effect::new("拡張描画");
+    for (key, default) in [
+        ("X", 0.0),
+        ("Y", 0.0),
+        ("Z", 0.0),
+        ("拡大率", 100.0),
+        ("透明度", 0.0),
+        ("縦横比", 0.0),
+        ("X軸回転", 0.0),
+        ("Y軸回転", 0.0),
+        ("Z軸回転", 0.0),
+        ("中心X", 0.0),
+        ("中心Y", 0.0),
+        ("中心Z", 0.0),
+        ("裏面を表示しない", 0.0),
+    ] {
+        let v = params.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(default);
+        d.push_track(key, Track::constant(v, 2));
+    }
+    d.push_text("blend", "0");
+    obj.effects.push(d);
+    obj
+}
+
+/// 制御オブジェクトの本体のパラメータを上書きする。
+fn control(mut obj: TimelineObject, params: &[(&str, f64)]) -> TimelineObject {
+    for (k, v) in params {
+        *obj.effects[0].param_mut(k).unwrap_or_else(|| panic!("{k}")) = au2_core::ParamValue::Track(Track::constant(*v, 2));
+    }
+    obj
+}
+
+/// グループ制御（対象レイヤー数 `range`）。
+fn group_control(params: &[(&str, f64)], range: &str) -> TimelineObject {
+    let mut g = control(TimelineObject::new_group_control(0, 9), params);
+    *g.effects[0].param_mut("range").expect("range") = au2_core::ParamValue::Text(range.into());
+    g
+}
+
+fn lit(p: [u8; 4]) -> bool {
+    p[0] > 245 || p[1] > 245 || p[2] > 245
+}
+
+fn dark(p: [u8; 4]) -> bool {
+    p[0] < 6 && p[1] < 6 && p[2] < 6
+}
+
+#[test]
+fn y_rotation_draws_a_perspective_trapezoid_and_90_degrees_is_edge_on() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(200, 200);
+    s.insert_object(0, extended(shape(0, 9, 2, "ffffff"), &[("Y軸回転", 60.0)]));
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    // 右端 (50, ±50, 0) → x' = 50cos60 = 25、z' = -50sin60 = -43.30（手前）→ 1024/980.70 = 1.0442 倍 → (26.10, ±52.21)
+    // 左端 → x' = -25、z' = +43.30（奥）→ 0.9594 倍 → (-23.99, ±47.97)。右が高い台形
+    assert!(lit(px(&f, 100, 100)), "中心");
+    assert!(lit(px(&f, 124, 100)), "x=24.5 は右端 26.10 の内側");
+    assert!(dark(px(&f, 127, 100)), "x=27.5 は右端の外");
+    assert!(dark(px(&f, 74, 100)), "x=-25.5 は左端 -23.99 の外");
+    // 上辺は左 (-23.99, -47.97) → 右 (26.10, -52.21)。x=24.5 での上辺 y=-52.07、x=-22.5 では y=-48.10
+    assert!(lit(px(&f, 124, 49)), "右寄りの上 (24.5, -50.5) は内側（透視が無ければ上辺 -50 の外）");
+    assert!(dark(px(&f, 77, 50)), "左寄りの上 (-22.5, -49.5) は外側（透視が無ければ内側）");
+    assert!(lit(px(&f, 124, 150)) && dark(px(&f, 77, 149)), "下辺も対称");
+
+    // 90°: 真横から見るので何も見えない
+    let mut s = scene(200, 200);
+    s.insert_object(0, extended(shape(0, 9, 2, "ffffff"), &[("Y軸回転", 90.0)]));
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    let max = f.pixels.chunks(4).map(|p| p[0]).max().unwrap();
+    assert!(max <= 2, "真横から見た板が見えている（最大 {max}）");
+}
+
+#[test]
+fn z_translation_scales_and_moves_toward_the_centre() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(200, 100);
+    // X=100, Z=1024: 2 倍の距離 → 半分の大きさ（50px）で、位置も中心へ半分寄る → 中心 x=50（画素 150）、x 125..175
+    s.insert_object(0, extended(shape(0, 9, 2, "00ff00"), &[("X", 100.0), ("Z", 1024.0)]));
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert!(lit(px(&f, 150, 50)), "中心");
+    assert!(lit(px(&f, 127, 50)) && lit(px(&f, 172, 50)), "幅 50 の内側");
+    assert!(dark(px(&f, 122, 50)) && dark(px(&f, 177, 50)), "幅 50 の外側");
+    assert!(lit(px(&f, 150, 27)) && dark(px(&f, 150, 22)), "高さも 50");
+}
+
+#[test]
+fn back_face_is_mirrored_or_hidden() {
+    let Some(mut r) = renderer() else { return };
+    let render = |r: &mut Renderer, params: &[(&str, f64)]| {
+        let mut s = scene(100, 100);
+        s.insert_object(0, extended(TimelineObject::new_image(0, 9, "gradient.png"), params));
+        r.render(&s, 0, &mut Gradient::new(40, 20)).unwrap()
+    };
+    // 180° 回すと裏から見るので左右反転: 左端が青、右端が赤
+    let f = render(&mut r, &[("Y軸回転", 180.0)]);
+    let (left, right) = (px(&f, 31, 50), px(&f, 68, 50));
+    assert!(left[2] > 200 && left[0] < 50, "裏面の左端は青: {left:?}");
+    assert!(right[0] > 200 && right[2] < 50, "裏面の右端は赤: {right:?}");
+    // 裏面を表示しない
+    let f = render(&mut r, &[("Y軸回転", 180.0), ("裏面を表示しない", 1.0)]);
+    assert!(f.pixels.chunks(4).all(|p| p == [0, 0, 0, 255]), "裏面が描かれている");
+    // 表なら「裏面を表示しない」でも描く
+    let f = render(&mut r, &[("Y軸回転", 30.0), ("裏面を表示しない", 1.0)]);
+    assert!(lit(px(&f, 50, 50)) || px(&f, 50, 50)[0] > 100, "表面が消えている: {:?}", px(&f, 50, 50));
+}
+
+#[test]
+fn camera_control_moves_only_camera_targets_below_it() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(400, 100);
+    // カメラを右へ 100（目標も）→ 対象のオブジェクトは画面上で左へ 100（画素 100）。対象外は中央（画素 200）のまま
+    s.insert_object(0, control(TimelineObject::new_camera_control(0, 9), &[("X", 100.0), ("目標X", 100.0)]));
+    let mut target = shape(0, 9, 2, "ff0000");
+    set_track(&mut target, "標準描画", "拡大率", 40.0);
+    target.camera_target = true;
+    s.insert_object(1, target);
+    let mut flat = shape(0, 9, 2, "0000ff");
+    set_track(&mut flat, "標準描画", "拡大率", 40.0);
+    s.insert_object(2, flat);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 100, 50), [255, 0, 0, 255], 1, "カメラの対象は左へ");
+    assert_near(px(&f, 200, 50), [0, 0, 255, 255], 1, "対象外は動かない");
+    assert_near(px(&f, 300, 50), [0, 0, 0, 255], 0, "右には何も無い");
+
+    // カメラを半分の距離（z=-512）へ寄せる → 2 倍（40 → 80px、画素 160..240）
+    let mut s = scene(400, 100);
+    s.insert_object(0, control(TimelineObject::new_camera_control(0, 9), &[("Z", -512.0)]));
+    let mut target = shape(0, 9, 2, "ff0000");
+    set_track(&mut target, "標準描画", "拡大率", 40.0);
+    target.camera_target = true;
+    s.insert_object(1, target);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert!(lit(px(&f, 162, 50)) && lit(px(&f, 237, 50)), "幅 80 の内側");
+    assert!(dark(px(&f, 157, 50)) && dark(px(&f, 243, 50)), "幅 80 の外側");
+}
+
+#[test]
+fn group_control_transforms_the_layers_in_its_range() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(300, 100);
+    // グループ制御（X=100、下 1 レイヤー）: レイヤー 2 の赤は右へ 100（画素 250）、レイヤー 3 の青（X=-100）はそのまま（画素 50）
+    s.insert_object(0, group_control(&[("X", 100.0)], "1"));
+    let mut red = shape(0, 9, 2, "ff0000");
+    set_track(&mut red, "標準描画", "拡大率", 40.0);
+    s.insert_object(1, red);
+    let mut blue = shape(0, 9, 2, "0000ff");
+    set_track(&mut blue, "標準描画", "拡大率", 40.0);
+    set_track(&mut blue, "標準描画", "X", -100.0);
+    s.insert_object(2, blue);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 250, 50), [255, 0, 0, 255], 1, "範囲内は移動");
+    assert_near(px(&f, 150, 50), [0, 0, 0, 255], 0, "元の位置には無い");
+    assert_near(px(&f, 50, 50), [0, 0, 255, 255], 1, "範囲外は動かない");
+
+    // 拡大率 50%・回転 90°: X=80 の 40px の四角 → (0, 40) の 20px（画素 x 90..110, y 130..150）
+    let mut s = scene(200, 200);
+    s.insert_object(0, group_control(&[("拡大率", 50.0), ("回転", 90.0)], "1"));
+    let mut obj = shape(0, 9, 2, "ffffff");
+    set_track(&mut obj, "標準描画", "拡大率", 40.0);
+    set_track(&mut obj, "標準描画", "X", 80.0);
+    s.insert_object(1, obj);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert!(lit(px(&f, 100, 140)) && lit(px(&f, 108, 148)), "回転・縮小した位置");
+    assert!(dark(px(&f, 112, 140)) && dark(px(&f, 100, 152)), "20px の外");
+    assert!(dark(px(&f, 180, 100)) && dark(px(&f, 140, 100)), "グループが無い場合・縮小だけの場合の位置には無い");
+}
+
+#[test]
+fn texture_coordinates_are_perspective_correct() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(400, 200);
+    // 200x100 の画像を Y 軸回転 60°: 右端 → 50·1024/937.40 = 54.62、左端 → -50·1024/1110.60 = -46.10。
+    // 画面中央にはローカル原点（画像の真ん中 = 赤 127 付近）が映る。画面上で線形に補間すると
+    // 左端から 46.10/100.72 = 0.458 の位置 = 赤 138 付近になってしまう
+    s.insert_object(0, extended(TimelineObject::new_image(0, 9, "gradient.png"), &[("Y軸回転", 60.0)]));
+    let f = r.render(&s, 0, &mut Gradient::new(200, 100)).unwrap();
+    let c = px(&f, 200, 100);
+    assert!((121..=132).contains(&c[0]) && (121..=134).contains(&c[2]), "中央の色 {c:?}（透視補正なら赤 ≒ 青 ≒ 127）");
+}
+
+#[test]
+fn plane_crossing_the_camera_draws_only_the_part_in_front() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(200, 100);
+    // 目の高さより 30 下に寝かせた（X 軸回転 90°）奥行き 4000 の床: z = -2000..2000。z < -1024 は目より後ろ。
+    // 画面の行 y には奥行き z = 30·1024/y - 1024 の床が映る。奥の端（z=2000）は y = 30·1024/3024 = 10.16。
+    // 目より上（y < 0）には何も映らない（後ろ側が裏返って上に出てはいけない）
+    s.insert_object(0, extended(shape(0, 9, 2, "ffffff"), &[("Y", 30.0), ("拡大率", 4000.0), ("X軸回転", 90.0)]));
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    for x in [0, 100, 199] {
+        assert!(lit(px(&f, x, 99)) && lit(px(&f, x, 62)), "手前の床 ({x})");
+        for y in 0..58 {
+            assert!(dark(px(&f, x, y)), "床の奥の端より上 ({x},{y}): {:?}", px(&f, x, y));
+        }
+    }
+}
+
+#[test]
+fn object_bounds_are_the_projected_quad() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(200, 200);
+    let obj = extended(shape(0, 9, 2, "ffffff"), &[("Y軸回転", 60.0)]);
+    let id = obj.id;
+    let hidden = extended(shape(0, 9, 2, "ffffff"), &[("Y軸回転", 180.0), ("裏面を表示しない", 1.0)]);
+    let hidden_id = hidden.id;
+    s.insert_object(0, obj);
+    s.insert_object(1, hidden);
+    r.render_to_framebuffer(&s, 0, &mut NoMedia).unwrap();
+    let b = r.object_bounds(id).expect("範囲");
+    // 右上 (26.10, -52.21)、左上 (-23.99, -47.97)（手計算は y_rotation_… のテスト参照）
+    let close = |a: [f32; 2], e: [f32; 2]| (a[0] - e[0]).abs() < 0.05 && (a[1] - e[1]).abs() < 0.05;
+    assert!(close(b.corners[1], [26.10, -52.21]), "{:?}", b.corners);
+    assert!(close(b.corners[0], [-23.99, -47.97]), "{:?}", b.corners);
+    assert!(close(b.corners[2], [26.10, 52.21]), "{:?}", b.corners);
+    assert!(r.object_bounds(hidden_id).is_none(), "描かなかった裏面には範囲が無い");
+}
+
+#[test]
+fn golden_draw3d() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(320, 180);
+    s.insert_object(0, shape(0, 9, 0, "141a33")); // 背景（3D の影響を受けない）
+    // 右上から見下ろすカメラ
+    s.insert_object(
+        1,
+        control(TimelineObject::new_camera_control(0, 9), &[("X", 160.0), ("Y", -220.0), ("Z", -900.0), ("目標Y", 20.0)]),
+    );
+    // 床（X 軸回転 90° で寝かせた四角）と、Y 軸回転した画像。どちらもカメラの対象
+    let mut floor = extended(shape(0, 9, 2, "3f51b5"), &[("Y", 70.0), ("拡大率", 300.0), ("X軸回転", 90.0)]);
+    floor.camera_target = true;
+    s.insert_object(2, floor);
+    let mut picture = extended(TimelineObject::new_image(0, 9, "gradient.png"), &[("Y", 10.0), ("Y軸回転", 35.0)]);
+    picture.camera_target = true;
+    s.insert_object(3, picture);
+    // グループ制御（下 2 レイヤー）: 左下へ寄せて少し回す。カメラの対象ではないので既定の視点のまま
+    s.insert_object(4, group_control(&[("X", -105.0), ("Y", 45.0), ("回転", 15.0)], "2"));
+    s.insert_object(5, extended(shape(0, 9, 1, "e94560"), &[("縦横比", 40.0), ("拡大率", 60.0), ("X", -25.0)]));
+    s.insert_object(6, extended(shape(0, 9, 6, "ffd54a"), &[("X", 30.0), ("Y軸回転", 50.0), ("中心X", 10.0), ("拡大率", 60.0)]));
+    let f = r.render(&s, 0, &mut Gradient::new(120, 60)).unwrap();
+    assert_golden("draw3d", &f);
+}
