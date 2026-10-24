@@ -33,6 +33,8 @@ pub enum RenderError {
     NoAdapter,
     #[error("GPU デバイスを取得できません: {0}")]
     RequestDevice(wgpu::RequestDeviceError),
+    #[error("シーンのサイズ {width}x{height} は GPU の上限（1 辺 {max}px）を超えています")]
+    SceneTooLarge { width: u32, height: u32, max: u32 },
     #[error("フレームの読み戻しに失敗しました: {0}")]
     Readback(String),
 }

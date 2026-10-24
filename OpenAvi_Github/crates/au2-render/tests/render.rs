@@ -83,8 +83,8 @@ fn circle_is_filled_inside_and_black_outside() {
     assert_near(px(&f, 100 + 55, 50), [0, 0, 0, 255], 1, "半径外");
     assert_near(px(&f, 5, 5), [0, 0, 0, 255], 1, "隅");
     // 縁の画素はアンチエイリアスで中間値になる
-    let edge = px(&f, 100 + 49, 50);
-    assert!(edge[0] > 0 && edge[0] < 255 || edge[0] == 255, "縁: {edge:?}");
+    let row: Vec<u8> = (140..160).map(|x| px(&f, x, 50)[0]).collect();
+    assert!(row.iter().any(|&v| v > 0 && v < 255), "縁にアンチエイリアスの中間値がある: {row:?}");
 }
 
 #[test]
@@ -233,12 +233,14 @@ fn golden_path(name: &str) -> PathBuf {
 /// 1 チャンネル ±3 の誤差を許し、超過する画素が全体の 0.1% 以内なら一致とみなす。
 fn assert_golden(name: &str, frame: &RgbaFrame) {
     let path = golden_path(name);
-    if std::env::var_os("UPDATE_GOLDEN").is_some() || !path.exists() {
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
         image::save_buffer(&path, &frame.pixels, frame.width, frame.height, image::ColorType::Rgba8).unwrap();
         eprintln!("ゴールデンイメージを書き出しました: {}", path.display());
         return;
     }
-    let expected = image::open(&path).unwrap().to_rgba8();
+    let expected = image::open(&path)
+        .unwrap_or_else(|e| panic!("{name}: ゴールデンイメージを開けません（UPDATE_GOLDEN=1 で作成）: {e}"))
+        .to_rgba8();
     assert_eq!((expected.width(), expected.height()), (frame.width, frame.height), "{name}: サイズ不一致");
     let bad = expected
         .as_raw()
@@ -292,7 +294,7 @@ fn golden_composition() {
 
 #[test]
 fn golden_sample_exo() {
-    // samples/sample.exo をそのまま描く（テキスト・動画は未対応のため図形とフィルタのみ反映される）
+    // samples/sample.exo をそのまま描く（フォントを設定しないのでテキストは描かれず、動画は見つからないためプレースホルダになる）
     let Some(mut r) = renderer() else { return };
     let bytes = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sample.exo")).unwrap();
     let doc = au2_exo::parse_exo_bytes(&bytes).unwrap();
@@ -350,4 +352,137 @@ fn object_bounds_follow_position_zoom_and_rotation() {
     // 範囲外のフレームでは記録されない
     r.render_to_framebuffer(&s, 50, &mut NoMedia).unwrap();
     assert!(r.object_bounds(id).is_none());
+}
+
+#[test]
+fn oversized_scene_is_an_error_not_a_panic() {
+    let Some(mut r) = renderer() else { return };
+    let max = r.gpu().device.limits().max_texture_dimension_2d;
+    let s = scene(max + 1, 8);
+    let err = r.render_to_framebuffer(&s, 0, &mut NoMedia).unwrap_err();
+    assert!(matches!(err, au2_render::RenderError::SceneTooLarge { .. }), "{err}");
+    // 上限以内なら通る（メモリ節約のため幅は 4096 まで）
+    assert!(r.render_to_framebuffer(&scene(max.min(4096), 4), 0, &mut NoMedia).is_ok());
+}
+
+/// 任意サイズのメディアを返す供給元（原寸を超える巨大画像のテスト用）。
+struct Huge(RgbaFrame);
+
+impl MediaSource for Huge {
+    fn frame(&mut self, _path: &str, _media_frame: u32, _time_sec: f64) -> Option<&RgbaFrame> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn image_wider_than_the_gpu_limit_is_downscaled_instead_of_panicking() {
+    let Some(mut r) = renderer() else { return };
+    let max = r.gpu().device.limits().max_texture_dimension_2d;
+    let (w, h) = (max + 8, 2u32);
+    let pixels = [200u8, 100, 50, 255].repeat((w * h) as usize);
+    let mut s = scene(64, 32);
+    s.insert_object(0, TimelineObject::new_image(0, 9, "huge.png"));
+    // 縮小してアップロードされても、描画上の大きさは元の幅（シーンより遥かに広い）。高さは 2px なので、
+    // 画像が覆うのは中央の 2 行（y=15,16）だけ
+    let f = r.render(&s, 0, &mut Huge(RgbaFrame { width: w, height: h, pixels })).unwrap();
+    assert_near(px(&f, 32, 16), [200, 100, 50, 255], 2, "画像が覆う帯の色");
+    assert_near(px(&f, 0, 15), [200, 100, 50, 255], 2, "左端まで届く（元の幅で描かれる）");
+    assert_near(px(&f, 32, 5), [0, 0, 0, 255], 0, "帯の外は黒");
+}
+
+/// 縮小デコードされる動画を模した供給元: 実フレームは 4x4 だが、本来のサイズは 16x16 と答える。
+struct Shrunk(RgbaFrame);
+
+impl MediaSource for Shrunk {
+    fn frame(&mut self, _path: &str, _media_frame: u32, _time_sec: f64) -> Option<&RgbaFrame> {
+        Some(&self.0)
+    }
+    fn native_size(&mut self, _path: &str) -> Option<(u32, u32)> {
+        Some((16, 16))
+    }
+}
+
+#[test]
+fn sprite_size_follows_native_size_not_decoded_size() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(40, 40);
+    s.insert_object(0, TimelineObject::new_video(0, 9, "v.mp4"));
+    let frame = RgbaFrame { width: 4, height: 4, pixels: [255u8, 0, 0, 255].repeat(16) };
+    let f = r.render(&s, 0, &mut Shrunk(frame)).unwrap();
+    // 16x16 が中央（x,y 12..28）に置かれる
+    assert_near(px(&f, 14, 20), [255, 0, 0, 255], 1, "16px 範囲の内側");
+    assert_near(px(&f, 10, 20), [0, 0, 0, 255], 1, "16px 範囲の左外");
+    assert_near(px(&f, 30, 20), [0, 0, 0, 255], 1, "右外");
+}
+
+/// 要求された時刻を記録し、長さ 1 秒の動画のふりをする供給元。
+struct Clip {
+    requested: Vec<f64>,
+    frame: RgbaFrame,
+}
+
+impl MediaSource for Clip {
+    fn frame(&mut self, _path: &str, _media_frame: u32, time_sec: f64) -> Option<&RgbaFrame> {
+        self.requested.push(time_sec);
+        Some(&self.frame)
+    }
+    fn duration_secs(&mut self, _path: &str) -> Option<f64> {
+        Some(1.0)
+    }
+}
+
+#[test]
+fn looping_video_wraps_its_time_at_the_clip_length() {
+    let Some(mut r) = renderer() else { return };
+    let frame = RgbaFrame { width: 2, height: 2, pixels: [255u8, 255, 255, 255].repeat(4) };
+    for (looping, expected) in [(true, 0.5), (false, 1.5)] {
+        let mut s = scene(8, 8); // 30fps
+        let mut obj = TimelineObject::new_video(0, 99, "clip.mp4");
+        set_track(&mut obj, "動画ファイル", "ループ再生", if looping { 1.0 } else { 0.0 });
+        s.insert_object(0, obj);
+        let mut clip = Clip { requested: Vec::new(), frame: frame.clone() };
+        r.render_to_framebuffer(&s, 45, &mut clip).unwrap(); // 1.5 秒の位置
+        if looping {
+            // 長さが分かっているので、巻き戻し前の時刻（1 秒超）は一度も要求しない
+            assert!(clip.requested.iter().all(|t| *t < 1.0), "巻き戻し前の時刻を要求している: {:?}", clip.requested);
+        }
+        let last = *clip.requested.last().unwrap();
+        assert!((last - expected).abs() < 1e-6, "ループ {looping}: 要求された時刻 {last}（期待 {expected}）");
+    }
+}
+
+/// 長さが分かるのは `prepare` の後だけ、という供給元（MKV を開く前のように、最初は長さが不明）。
+struct OpensOnPrepare {
+    prepared: bool,
+    requested: Vec<f64>,
+    frame: RgbaFrame,
+}
+
+impl MediaSource for OpensOnPrepare {
+    fn frame(&mut self, _path: &str, _media_frame: u32, time_sec: f64) -> Option<&RgbaFrame> {
+        self.requested.push(time_sec);
+        Some(&self.frame)
+    }
+    fn prepare(&mut self, _path: &str) {
+        self.prepared = true;
+    }
+    fn duration_secs(&mut self, _path: &str) -> Option<f64> {
+        self.prepared.then_some(1.0)
+    }
+}
+
+#[test]
+fn loop_opens_the_video_before_requesting_any_frame() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(8, 8);
+    let mut obj = TimelineObject::new_video(0, 99, "clip.mp4");
+    set_track(&mut obj, "動画ファイル", "ループ再生", 1.0);
+    s.insert_object(0, obj);
+    let frame = RgbaFrame { width: 2, height: 2, pixels: [255u8; 16].to_vec() };
+    let mut media = OpensOnPrepare { prepared: false, requested: Vec::new(), frame };
+    r.render_to_framebuffer(&s, 45, &mut media).unwrap(); // 1.5 秒
+    assert!(media.prepared, "先に prepare される");
+    // 長さが分かったので、巻き戻し前の時刻（1.5 秒）では一度も要求しない = 終端の先へのシークを起こさない
+    assert_eq!(media.requested.len(), 1, "要求は 1 回だけ: {:?}", media.requested);
+    assert!((media.requested[0] - 0.5).abs() < 1e-6, "要求された時刻 {}", media.requested[0]);
 }

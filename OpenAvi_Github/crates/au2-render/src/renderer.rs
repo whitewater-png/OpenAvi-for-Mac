@@ -19,6 +19,8 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// テクスチャキャッシュの上限枚数（超えたら全消去する簡易方式）。
 const TEXTURE_CACHE_LIMIT: usize = 64;
+/// 動画フレームのテクスチャを残す枚数。
+const VIDEO_TEXTURE_KEEP: usize = 16;
 
 /// テキストのテクスチャキャッシュキーの接頭辞（フォント変更時に無効化するため）。
 const TEXT_KEY_PREFIX: &str = "\0text\0";
@@ -82,13 +84,16 @@ struct Targets {
     height: u32,
     main: wgpu::Texture,
     main_view: wgpu::TextureView,
-    /// 画面表示用（sRGB として解釈するビュー）。egui はテクスチャを sRGB として扱うため、
-    /// ガンマ空間の値をそのまま渡すと二重にガンマ補正されて白っぽくなる。
+    /// `view_formats` が使えない環境（GL など）だけ作る、sRGB フォーマットのコピー先。
+    /// 対応環境では `main` の sRGB ビューをそのまま表示に使うので `None`（Metal ではフォーマット違いの
+    /// テクスチャ間コピーが未定義動作になるため、この経路は使わない）。
+    display: Option<wgpu::Texture>,
     display_view: wgpu::TextureView,
     /// フィルタパスが読む用のコピー先（ping-pong 相手）
     scratch: wgpu::Texture,
     scratch_bind_group: wgpu::BindGroup,
-    readback: wgpu::Buffer,
+    /// 読み戻し用バッファ。プレビューは読み戻さないので、最初の `render()` まで作らない
+    readback: Option<wgpu::Buffer>,
     padded_row: u32,
 }
 
@@ -107,6 +112,8 @@ pub struct Renderer {
     generation: u64,
     targets: Option<Targets>,
     textures: HashMap<(String, u32), Arc<TexEntry>>,
+    /// 動画フレームのキャッシュキー（古い順）
+    video_keys: std::collections::VecDeque<(String, u32)>,
 }
 
 fn uniform_entry(visibility: wgpu::ShaderStages, size: usize) -> wgpu::BindGroupLayoutEntry {
@@ -287,6 +294,7 @@ impl Renderer {
             generation: 0,
             targets: None,
             textures: HashMap::new(),
+            video_keys: std::collections::VecDeque::new(),
         }
     }
 
@@ -358,40 +366,64 @@ impl Renderer {
         TexEntry { size: (width, height), _texture: texture, bind_group }
     }
 
-    fn ensure_targets(&mut self, width: u32, height: u32) {
+    fn ensure_targets(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
+        let max = self.gpu.device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(RenderError::SceneTooLarge { width, height, max });
+        }
         if self.targets.as_ref().is_some_and(|t| t.width == width && t.height == height) {
-            return;
+            return Ok(());
         }
         let device = &self.gpu.device;
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
         let srgb = [FORMAT.add_srgb_suffix()];
-        let make = |label: &str, usage: wgpu::TextureUsages, view_formats: &[wgpu::TextureFormat]| {
+        let make = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages, view_formats: &[wgpu::TextureFormat]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
+                format,
                 usage,
                 view_formats,
             })
         };
         let main = make(
             "framebuffer",
+            FORMAT,
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::TEXTURE_BINDING,
-            &srgb,
+            if self.gpu.view_formats { &srgb } else { &[] },
         );
-        let scratch =
-            make("framebuffer scratch", wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING, &[]);
-        let main_view = main.create_view(&wgpu::TextureViewDescriptor::default());
-        let display_view = main.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(FORMAT.add_srgb_suffix()),
-            ..Default::default()
+        let scratch = make(
+            "framebuffer scratch",
+            FORMAT,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            &[],
+        );
+        // 表示用の sRGB 解釈:
+        //  - 対応環境: 同じテクスチャの sRGB ビュー（コピー不要）
+        //  - 未対応環境（GL）: sRGB フォーマットの別テクスチャへコピーする。
+        //    Metal ではフォーマット違いのテクスチャ間コピーが一時ビューの解放済み参照を生むため、使わない。
+        let display = (!self.gpu.view_formats).then(|| {
+            make(
+                "framebuffer display",
+                FORMAT.add_srgb_suffix(),
+                wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                &[],
+            )
         });
+        let main_view = main.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_view = match &display {
+            Some(texture) => texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            None => main.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(FORMAT.add_srgb_suffix()),
+                ..Default::default()
+            }),
+        };
         let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor::default());
         let scratch_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scratch bind group"),
@@ -399,35 +431,43 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) }],
         });
         let padded_row = align_up(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: padded_row as u64 * height as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         self.generation += 1;
-        self.targets = Some(Targets { width, height, main, main_view, display_view, scratch, scratch_bind_group, readback, padded_row });
+        self.targets = Some(Targets { width, height, main, main_view, display, display_view, scratch, scratch_bind_group, readback: None, padded_row });
+        Ok(())
     }
 
     /// メディアフレームを GPU テクスチャにしてキャッシュします。
-    fn media_texture(&mut self, key: (String, u32), frame: &RgbaFrame) -> Option<Arc<TexEntry>> {
+    /// `is_video` のフレームは古いものから 16 枚だけ残す（再生中に静止画・テキストのキャッシュを巻き込んで消さないため）。
+    /// GPU の最大テクスチャサイズを超える画像は縮小してアップロードし、`size` には元のサイズを残す。
+    fn media_texture(&mut self, key: (String, u32), frame: &RgbaFrame, is_video: bool) -> Option<Arc<TexEntry>> {
         if let Some(t) = self.textures.get(&key) {
             return Some(t.clone());
         }
-        if frame.width == 0 || frame.height == 0 || frame.pixels.len() != (frame.width * frame.height * 4) as usize {
+        if frame.width == 0 || frame.height == 0 || frame.pixels.len() != (frame.width as usize) * (frame.height as usize) * 4 {
             return None;
         }
         if self.textures.len() >= TEXTURE_CACHE_LIMIT {
             self.textures.clear();
+            self.video_keys.clear();
         }
-        let entry = Arc::new(Self::make_texture_entry(
-            &self.gpu,
-            &self.texture_layout,
-            &self.sampler,
-            frame.width,
-            frame.height,
-            &frame.pixels,
-        ));
+        let max = self.gpu.device.limits().max_texture_dimension_2d;
+        let fitted = frame.fit_within(max);
+        let (uploaded, original) = match &fitted {
+            Some(small) => (small, (frame.width, frame.height)),
+            None => (frame, (frame.width, frame.height)),
+        };
+        let mut entry =
+            Self::make_texture_entry(&self.gpu, &self.texture_layout, &self.sampler, uploaded.width, uploaded.height, &uploaded.pixels);
+        entry.size = original;
+        let entry = Arc::new(entry);
+        if is_video {
+            self.video_keys.push_back(key.clone());
+            while self.video_keys.len() > VIDEO_TEXTURE_KEEP {
+                if let Some(old) = self.video_keys.pop_front() {
+                    self.textures.remove(&old);
+                }
+            }
+        }
         self.textures.insert(key, entry.clone());
         Some(entry)
     }
@@ -442,7 +482,7 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let width = scene.settings.width.max(1);
         let height = scene.settings.height.max(1);
-        self.ensure_targets(width, height);
+        self.ensure_targets(width, height)?;
 
         let limits = self.gpu.device.limits();
         let sprite_stride = align_up(std::mem::size_of::<SpriteUniform>() as u32, limits.min_uniform_buffer_offset_alignment);
@@ -605,6 +645,23 @@ impl Renderer {
             }
         }
 
+        if let Some(display) = &targets.display {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &targets.main,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: display,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
         self.gpu.queue.submit([encoder.finish()]);
         Ok(())
     }
@@ -618,7 +675,20 @@ impl Renderer {
     ) -> Result<RgbaFrame, RenderError> {
         self.render_to_framebuffer(scene, frame, media)?;
         let device = &self.gpu.device;
-        let targets = self.targets.as_ref().expect("render_to_framebuffer で確保済み");
+        {
+            let targets = self.targets.as_mut().expect("render_to_framebuffer で確保済み");
+            let size = targets.padded_row as u64 * targets.height as u64;
+            targets.readback.get_or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            });
+        }
+        let targets = self.targets.as_ref().expect("確保済み");
+        let readback = targets.readback.as_ref().expect("直前に作成済み");
         let (width, height) = (targets.width, targets.height);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
         encoder.copy_texture_to_buffer(
@@ -629,7 +699,7 @@ impl Renderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::ImageCopyBuffer {
-                buffer: &targets.readback,
+                buffer: readback,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(targets.padded_row),
@@ -640,7 +710,7 @@ impl Renderer {
         );
         self.gpu.queue.submit([encoder.finish()]);
 
-        let slice = targets.readback.slice(..);
+        let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -649,14 +719,14 @@ impl Renderer {
         rx.recv()
             .map_err(|e| RenderError::Readback(e.to_string()))?
             .map_err(|e| RenderError::Readback(e.to_string()))?;
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
         {
             let data = slice.get_mapped_range();
             for row in data.chunks(targets.padded_row as usize).take(height as usize) {
-                pixels.extend_from_slice(&row[..(width * 4) as usize]);
+                pixels.extend_from_slice(&row[..width as usize * 4]);
             }
         }
-        targets.readback.unmap();
+        readback.unmap();
         Ok(RgbaFrame { width, height, pixels })
     }
 
@@ -713,10 +783,36 @@ impl Renderer {
                     let speed = (src.eval("再生速度", rel, 100.0) / 100.0).max(0.0);
                     let media_frame = (start + rel as f64 * speed).floor() as u32;
                     let sec = media_frame as f64 / fps.max(1.0);
+                    let is_video = src.kind == EffectKind::VideoFile;
+                    // 「ループ再生」: 動画の長さを超えた位置は先頭へ巻き戻す（長さは最初のフレーム取得後に分かる）
+                    let looping = is_video && src.eval("ループ再生", rel, 0.0) >= 0.5;
+                    let mut sec = sec;
+                    if looping {
+                        // 長さは供給元が動画を開いた後に分かる。分かっていれば、巻き戻し前の時刻では何も要求しない
+                        // （終端の先を要求すると、キャッシュが空のとき終端へシークして無駄に ffmpeg を起動してしまう）
+                        let mut duration = media.duration_secs(file);
+                        if duration.is_none() {
+                            // まず動画を開かせて（フレームは要求しない）、長さが分かるか見る。
+                            // MKV/WebM のように分からない場合だけ、実際の位置を要求して終端から学習させる
+                            media.prepare(file);
+                            duration = media.duration_secs(file);
+                            if duration.is_none() {
+                                let _ = media.frame(file, media_frame, sec);
+                                duration = media.duration_secs(file);
+                            }
+                        }
+                        if let Some(duration) = duration.filter(|d| *d > 0.0) {
+                            sec = sec.rem_euclid(duration);
+                        }
+                    }
                     let frame = media.frame(file, media_frame, sec)?;
-                    let key_frame = if src.kind == EffectKind::ImageFile { 0 } else { media_frame };
-                    let entry = self.media_texture((file.to_string(), key_frame), frame)?;
-                    Some((entry, frame.width, frame.height))
+                    // 動画はプロジェクトのフレーム番号ではなく時刻（ミリ秒）で区別する。
+                    // フレームレートを変えても、同じ番号が別の時刻を指して古いテクスチャを返すことがない
+                    let key_frame = if is_video { (sec * 1000.0).round() as u32 } else { 0 };
+                    let entry = self.media_texture((file.to_string(), key_frame), frame, is_video)?;
+                    // デコード解像度が縮小されていても、描画上の大きさは動画本来のサイズで決める
+                    let (w, h) = media.native_size(file).unwrap_or(entry.size);
+                    Some((entry, w, h))
                 });
                 match tex {
                     Some((entry, w, h)) => Some((
@@ -745,7 +841,7 @@ impl Renderer {
                     None => {
                         let rgb = [(cr * 255.0).round() as u8, (cg * 255.0).round() as u8, (cb * 255.0).round() as u8];
                         let bitmap = crate::text::rasterize(self.font.as_ref()?, &body, size, rgb)?;
-                        self.media_texture(key, &bitmap)?
+                        self.media_texture(key, &bitmap, false)?
                     }
                 };
                 let (w, h) = entry.size;
