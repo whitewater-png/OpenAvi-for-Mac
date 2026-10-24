@@ -32,6 +32,15 @@ pub enum MoveKind {
 }
 
 impl MoveKind {
+    /// 反復移動の `.exo` 移動方法番号。専用バリアントを持たず `Other(7)` として保持する
+    /// （他クレートの網羅 match を壊さないため）。
+    pub const REPEAT_CODE: u32 = 7;
+
+    /// 反復移動を表す値。
+    pub fn repeat() -> Self {
+        MoveKind::Other(Self::REPEAT_CODE)
+    }
+
     pub fn label(&self) -> String {
         match self {
             MoveKind::Linear => "直線移動".into(),
@@ -41,6 +50,7 @@ impl MoveKind {
             MoveKind::MoveAmount => "移動量指定".into(),
             MoveKind::Random => "ランダム移動".into(),
             MoveKind::Script(name) => format!("スクリプト: {name}"),
+            MoveKind::Other(code) if *code == Self::REPEAT_CODE => "反復移動".into(),
             MoveKind::Other(code) => format!("不明な移動方法({code})"),
         }
     }
@@ -109,6 +119,14 @@ impl Interpolation {
 
     pub fn linear() -> Self {
         Self::new(MoveKind::Linear)
+    }
+
+    /// `param` をカンマ区切りの数値列として解釈します（解釈できない要素は 0 扱い）。
+    pub fn param_numbers(&self) -> Vec<f64> {
+        match &self.param {
+            Some(p) => p.split(',').map(|x| x.trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0)).collect(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -182,7 +200,30 @@ impl Track {
                 let p3 = if i + 2 < keys.len() { keys[i + 2].value } else { b.value };
                 catmull_rom(p0, a.value, b.value, p3, t)
             }
-            // TODO: 移動量指定・ランダム移動・スクリプト移動は Phase 2 以降で正確に実装
+            // 移動量指定: 区間開始値から param 分だけ動く（終了値は使わない）。
+            MoveKind::MoveAmount => {
+                let amount = interp.param_numbers().first().copied().unwrap_or(b.value - a.value);
+                a.value + amount * t
+            }
+            MoveKind::Random => {
+                let nums = interp.param_numbers();
+                let interval = nums.first().copied().filter(|v| *v >= 1.0).unwrap_or(1.0).floor() as i64;
+                let seed = nums.get(1).copied().unwrap_or(0.0) as i64 as u64;
+                let step = (frame - a.frame) as i64 / interval;
+                let r = unit_random(seed, a.frame as i64, step);
+                let (lo, hi) = if a.value <= b.value { (a.value, b.value) } else { (b.value, a.value) };
+                lo + (hi - lo) * r
+            }
+            MoveKind::Other(code) if *code == MoveKind::REPEAT_CODE => {
+                let count = interp.param_numbers().first().copied().filter(|v| *v >= 1.0).unwrap_or(1.0).floor();
+                // 三角波: 0→1→0 を count 回。加減速は往路・復路それぞれの形に適用する。
+                let phase = norm(frame, a.frame, b.frame) * count * 2.0;
+                let k = phase.floor();
+                let f = phase - k;
+                let tri = if (k as i64) % 2 == 0 { f } else { 1.0 - f };
+                lerp(a.value, b.value, interp.easing.apply(tri))
+            }
+            // スクリプト移動などは未対応（直線補間で代用）
             _ => lerp(a.value, b.value, t),
         }
     }
@@ -212,6 +253,17 @@ fn norm(f: Frame, a: Frame, b: Frame) -> f64 {
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
+}
+
+/// 決定的な擬似乱数（splitmix64）。0.0..1.0 を返す。
+fn unit_random(seed: u64, key: i64, step: i64) -> f64 {
+    let mut z = seed
+        .wrapping_add((key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add((step as u64).wrapping_add(1).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
@@ -258,6 +310,87 @@ mod tests {
     fn curve_passes_through_keys() {
         let t = track(MoveKind::Curve, &[(0, 0.0), (10, 100.0), (20, 0.0)]);
         assert!((t.evaluate(10) - 100.0).abs() < 1e-9);
+    }
+
+    fn with(kind: MoveKind, easing: Easing, param: Option<&str>, keys: &[(Frame, f64)]) -> Track {
+        let mut t = track(kind, keys);
+        let i = t.interpolation.as_mut().unwrap();
+        i.easing = easing;
+        i.param = param.map(String::from);
+        t
+    }
+
+    #[test]
+    fn move_amount_uses_param_from_start() {
+        let t = with(MoveKind::MoveAmount, Easing::None, Some("50"), &[(0, 10.0), (10, 999.0)]);
+        assert_eq!(t.evaluate(0), 10.0);
+        assert_eq!(t.evaluate(5), 35.0);
+        assert_eq!(t.evaluate(10), 999.0); // 終端キーはそのまま
+        assert_eq!(t.evaluate(9), 10.0 + 50.0 * 0.9);
+    }
+
+    #[test]
+    fn move_amount_without_param_falls_back_to_linear() {
+        let t = with(MoveKind::MoveAmount, Easing::None, None, &[(0, 0.0), (10, 100.0)]);
+        assert_eq!(t.evaluate(5), 50.0);
+    }
+
+    #[test]
+    fn move_amount_respects_easing() {
+        let t = with(MoveKind::MoveAmount, Easing::EaseIn, Some("100"), &[(0, 0.0), (10, 0.0)]);
+        assert_eq!(t.evaluate(5), 25.0);
+    }
+
+    #[test]
+    fn random_is_deterministic_and_in_range() {
+        let t = with(MoveKind::Random, Easing::None, Some("1,7"), &[(0, 20.0), (200, 10.0)]);
+        let vals: Vec<f64> = (1..200).map(|f| t.evaluate(f)).collect();
+        assert!(vals.iter().all(|v| (10.0..=20.0).contains(v)));
+        assert_eq!(vals, (1..200).map(|f| t.evaluate(f)).collect::<Vec<_>>());
+        assert!(vals.windows(2).any(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn random_seed_changes_sequence() {
+        let a = with(MoveKind::Random, Easing::None, Some("1,1"), &[(0, 0.0), (100, 1.0)]);
+        let b = with(MoveKind::Random, Easing::None, Some("1,2"), &[(0, 0.0), (100, 1.0)]);
+        assert!((1..100).any(|f| a.evaluate(f) != b.evaluate(f)));
+    }
+
+    #[test]
+    fn random_holds_value_for_interval() {
+        let t = with(MoveKind::Random, Easing::None, Some("10"), &[(0, 0.0), (100, 1.0)]);
+        assert_eq!(t.evaluate(10), t.evaluate(19));
+        assert!((0..10).any(|k| t.evaluate(10 * k + 1) != t.evaluate(10 * (k + 1) + 1)));
+    }
+
+    #[test]
+    fn repeat_triangle_wave() {
+        let t = with(MoveKind::repeat(), Easing::None, Some("2"), &[(0, 0.0), (40, 100.0)]);
+        assert_eq!(t.evaluate(5), 50.0); // 往路
+        assert_eq!(t.evaluate(10), 100.0); // 折り返し
+        assert_eq!(t.evaluate(15), 50.0); // 復路
+        assert_eq!(t.evaluate(25), 50.0); // 2 周期目
+        assert_eq!(t.evaluate(30), 100.0);
+        assert_eq!(t.evaluate(40), 100.0); // 終端キー
+    }
+
+    #[test]
+    fn repeat_default_count_is_one_and_easing_applies() {
+        let t = with(MoveKind::repeat(), Easing::EaseIn, None, &[(0, 0.0), (20, 100.0)]);
+        assert_eq!(t.evaluate(5), 25.0); // phase 0.5 → eased 0.25
+        assert_eq!(t.evaluate(15), 25.0); // 復路対称
+    }
+
+    #[test]
+    fn instant_and_easing_variants() {
+        let t = with(MoveKind::Instant, Easing::EaseIn, None, &[(0, 1.0), (10, 9.0)]);
+        assert_eq!(t.evaluate(9), 1.0);
+        let t = with(MoveKind::Linear, Easing::EaseInOut, None, &[(0, 0.0), (10, 100.0)]);
+        assert_eq!(t.evaluate(5), 50.0);
+        assert!(t.evaluate(2) < 20.0);
+        let t = with(MoveKind::IgnoreMidpoint, Easing::EaseOut, None, &[(0, 0.0), (10, 5.0), (20, 100.0)]);
+        assert_eq!(t.evaluate(10), 75.0);
     }
 
     #[test]
