@@ -24,6 +24,7 @@ pub mod effect;
 pub mod id;
 pub mod object;
 pub mod project;
+pub mod scene_time;
 pub mod time;
 pub mod track;
 

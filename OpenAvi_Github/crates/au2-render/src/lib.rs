@@ -39,4 +39,6 @@ pub enum RenderError {
     SceneTooLarge { width: u32, height: u32, max: u32 },
     #[error("フレームの読み戻しに失敗しました: {0}")]
     Readback(String),
+    #[error("プロジェクトに {0} 番目のシーンがありません")]
+    NoSuchScene(usize),
 }

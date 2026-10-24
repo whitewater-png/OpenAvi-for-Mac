@@ -16,6 +16,9 @@ use crate::gpu::Gpu;
 use crate::media::MediaSource;
 use crate::RenderError;
 
+mod nested;
+use nested::{PrevSprite, SceneCtx};
+
 /// フレームバッファのフォーマット。ガンマ空間のまま扱う（AviUtl と同じく sRGB 変換をしない）。
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -79,6 +82,8 @@ enum Op {
     /// クリッピング元（上のオブジェクト）の不透明度をマスクへ描く。直後の `SpritePath::Ext` のスプライトが読む
     ClipMask { offset: u32, tex: Option<Arc<TexEntry>> },
     ColorCorrection { offset: u32 },
+    /// フレームバッファオブジェクト: ここまでの合成結果を `tex` に写し取る（`clear` なら写した後に背景で塗り直す）
+    Snapshot { tex: Arc<TexEntry>, clear: bool },
 }
 
 /// スプライトの描画経路。
@@ -137,6 +142,12 @@ pub struct Renderer {
     video_keys: std::collections::VecDeque<(String, u32)>,
     /// テキスト画像ごとの位置合わせ点（揃え）。`textures` のテキストキーと対応する
     text_anchors: HashMap<(String, u32), [f32; 2]>,
+    /// シーンオブジェクトの子シーンを描く作業用フレームバッファ（入れ子の深さごと）
+    nested_targets: HashMap<usize, Targets>,
+    /// シーンオブジェクトごとの、子シーンの描画結果
+    scene_textures: HashMap<ObjectId, Arc<TexEntry>>,
+    /// フレームバッファオブジェクトが写し取る先（サイズごと）
+    snapshots: HashMap<(u32, u32), Arc<TexEntry>>,
 }
 
 fn uniform_entry(visibility: wgpu::ShaderStages, size: usize) -> wgpu::BindGroupLayoutEntry {
@@ -383,6 +394,9 @@ impl Renderer {
             textures: HashMap::new(),
             video_keys: std::collections::VecDeque::new(),
             text_anchors: HashMap::new(),
+            nested_targets: HashMap::new(),
+            scene_textures: HashMap::new(),
+            snapshots: HashMap::new(),
         }
     }
 
@@ -597,6 +611,17 @@ impl Renderer {
         frame: Frame,
         media: &mut dyn MediaSource,
     ) -> Result<(), RenderError> {
+        self.render_scene(scene, frame, media, &SceneCtx::root(&[], None))
+    }
+
+    /// `ctx` の下で `scene` を `self.targets` に描きます（シーンオブジェクトの子シーンでも使う）。
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        frame: Frame,
+        media: &mut dyn MediaSource,
+        ctx: &SceneCtx<'_>,
+    ) -> Result<(), RenderError> {
         let width = scene.settings.width.max(1);
         let height = scene.settings.height.max(1);
         self.ensure_targets(width, height)?;
@@ -616,20 +641,40 @@ impl Renderer {
         let mut clip_source: Option<(usize, SpriteUniform, Option<Arc<TexEntry>>)> = None;
         // グループ制御・カメラ制御（レイヤー順に登録し、下のオブジェクトに掛ける）
         let mut controls = Controls::new(canvas[1]);
+        // 直前オブジェクト用: 直前に描いたスプライト
+        let mut prev: Option<PrevSprite> = None;
 
-        for (li, obj) in scene.objects_at(frame) {
+        for (li, obj, layer_frame) in au2_core::scene_time::objects_at_remapped(scene, frame) {
             if !scene.layers[li].visible {
                 continue;
             }
             let Some(src) = obj.source().filter(|s| s.enabled) else { continue };
-            let rel = frame - obj.frame_start;
+            // 時間制御の下では、置き換え後の時刻での相対フレーム
+            let rel = layer_frame - obj.frame_start;
             match obj.category() {
                 ObjectCategory::Media => {
+                    if src.kind == EffectKind::FrameBuffer {
+                        let clear = src.eval("フレームバッファをクリア", rel, 0.0) >= 0.5;
+                        ops.push(Op::Snapshot { tex: self.snapshot_texture(width, height), clear });
+                    }
                     let params = controls.apply(li, obj, eval_draw_params(obj, rel, fps));
                     if params.alpha <= 0.0 {
                         continue;
                     }
-                    if let Some((mut uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
+                    let sprite = match src.kind {
+                        EffectKind::Scene => self.scene_sprite(obj, rel, fps, canvas, params, media, ctx),
+                        EffectKind::FrameBuffer => {
+                            Some(nested::framebuffer_sprite(canvas, params, self.snapshot_texture(width, height)))
+                        }
+                        EffectKind::PreviousObject => prev.as_ref().map(|p| p.redraw(params)),
+                        _ => self.sprite_for(obj, rel, fps, canvas, params, media),
+                    };
+                    if let Some((mut uniform, tex)) = sprite {
+                        // シーン・フレームバッファ・直前オブジェクトのスプライトも、3D 配置（グループ・カメラ込み）にする
+                        if matches!(src.kind, EffectKind::Scene | EffectKind::FrameBuffer | EffectKind::PreviousObject) {
+                            uniform.ext = params.homography().to_ext();
+                        }
+                        prev = Some(PrevSprite { uniform, tex: tex.clone(), zoom: params.zoom });
                         // --- 合成モード・クリッピング（docs/RENDER_DESIGN.md「合成モード・クリッピング」）---
                         uniform.blend = [BlendMode::of_object(obj).code(), 0, 0, 0];
                         let is_source = blend::is_clip_source(scene, li, frame);
@@ -735,10 +780,10 @@ impl Renderer {
             ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
         };
 
-        // 背景は不透明な黒
+        // 背景（ルートは不透明な黒、シーンオブジェクトの子シーンは透明）
         drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear"),
-            color_attachments: &[Some(color_attachment(wgpu::LoadOp::Clear(wgpu::Color::BLACK)))],
+            color_attachments: &[Some(color_attachment(wgpu::LoadOp::Clear(ctx.background)))],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -844,6 +889,10 @@ impl Renderer {
                     pass.draw(0..3, 0..1);
                     i += 1;
                 }
+                Op::Snapshot { tex, clear } => {
+                    nested::record_snapshot(&mut encoder, targets, &tex._texture, *clear, ctx.background);
+                    i += 1;
+                }
             }
         }
 
@@ -876,6 +925,11 @@ impl Renderer {
         media: &mut dyn MediaSource,
     ) -> Result<RgbaFrame, RenderError> {
         self.render_to_framebuffer(scene, frame, media)?;
+        self.read_framebuffer()
+    }
+
+    /// 直近の描画結果を CPU へ読み戻します。
+    fn read_framebuffer(&mut self) -> Result<RgbaFrame, RenderError> {
         let device = &self.gpu.device;
         {
             let targets = self.targets.as_mut().expect("render_to_framebuffer で確保済み");

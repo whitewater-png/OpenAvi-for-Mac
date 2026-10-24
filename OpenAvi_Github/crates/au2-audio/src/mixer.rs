@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use au2_core::{Frame, Scene, TimelineObject};
+use au2_core::scene_time::{scene_index, ScenePlayback};
+use au2_core::{Effect, EffectKind, Frame, Project, Scene, TimelineObject};
 
 use crate::{CHANNELS, SAMPLE_RATE};
 
@@ -97,8 +98,48 @@ pub fn frame_to_sample(frame: Frame, fps: f64) -> usize {
 ///
 /// 対象は音声ファイルオブジェクト（音量・左右・再生位置・再生速度・ループ）。表示されているレイヤーのみ。
 /// `resolve` はオブジェクトに書かれたファイル名を実際のパスへ解決する関数。
+/// シーン(音声) オブジェクトは描かない（参照先のシーンが無い）。それも鳴らすには [`mix_project`] を使う。
 pub fn mix(
     scene: &Scene,
+    cache: &mut AudioCache,
+    start: Frame,
+    end: Frame,
+    resolve: &dyn Fn(&str) -> PathBuf,
+) -> Vec<f32> {
+    clamp(mix_scene(scene, &[], &mut Vec::new(), cache, start, end, resolve))
+}
+
+/// `project.scenes[scene_index]` の `start..end` をミックスします。[`mix`] に加えて、シーン(音声) オブジェクトが
+/// 同じプロジェクトの別シーンの音声を鳴らす（循環参照は鳴らさない）。シーンが無ければ無音。
+pub fn mix_project(
+    project: &Project,
+    scene_index: usize,
+    cache: &mut AudioCache,
+    start: Frame,
+    end: Frame,
+    resolve: &dyn Fn(&str) -> PathBuf,
+) -> Vec<f32> {
+    let Some(scene) = project.scenes.get(scene_index) else {
+        return Vec::new();
+    };
+    clamp(mix_scene(scene, &project.scenes, &mut vec![scene_index], cache, start, end, resolve))
+}
+
+/// シーン(音声) の入れ子の上限。
+const MAX_SCENE_DEPTH: usize = 8;
+
+fn clamp(mut out: Vec<f32>) -> Vec<f32> {
+    for s in &mut out {
+        *s = s.clamp(-1.0, 1.0);
+    }
+    out
+}
+
+/// クリップせずにミックスする（入れ子のシーンは親でまとめてクリップする）。`stack` は鳴らしている途中のシーンの添字。
+fn mix_scene(
+    scene: &Scene,
+    scenes: &[Scene],
+    stack: &mut Vec<usize>,
     cache: &mut AudioCache,
     start: Frame,
     end: Frame,
@@ -114,16 +155,99 @@ pub fn mix(
             if obj.frame_end < start || obj.frame_start >= end {
                 continue;
             }
-            let Some(src) = obj.source().filter(|s| s.enabled && s.name == "音声ファイル") else { continue };
+            let Some(src) = obj.source().filter(|s| s.enabled) else { continue };
+            if src.kind == EffectKind::SceneAudio {
+                mix_scene_audio(&mut out, base, total, obj, fps, scenes, stack, cache, resolve);
+                continue;
+            }
+            if src.name != "音声ファイル" {
+                continue;
+            }
             let Some(file) = src.text("file").filter(|f| !f.trim().is_empty()) else { continue };
             let Some(clip) = cache.get(&resolve(file)) else { continue };
             mix_object(&mut out, base, total, obj, &clip, fps);
         }
     }
-    for s in &mut out {
-        *s = s.clamp(-1.0, 1.0);
-    }
     out
+}
+
+/// 標準再生の音量・左右から、左右のゲイン。
+fn gains(play: Option<&Effect>, rel: Frame) -> (f32, f32) {
+    let volume = play.map_or(100.0, |p| p.eval("音量", rel, 100.0)) as f32 / 100.0;
+    let pan = play.map_or(0.0, |p| p.eval("左右", rel, 0.0)).clamp(-100.0, 100.0) as f32 / 100.0;
+    (volume * (1.0 - pan).min(1.0), volume * (1.0 + pan).min(1.0))
+}
+
+/// シーン(音声): 参照先のシーンを、必要な範囲だけ再帰的にミックスして足し込む。
+///
+/// 近似: 再生位置・再生速度・ループ再生はオブジェクト先頭の値で固定（動かしても追従しない）。速度変更は最近傍サンプル。
+/// 子シーンの長さを越えたら、ループ再生なら先頭へ戻り、そうでなければ無音（音声ファイルと同じ）。
+#[allow(clippy::too_many_arguments)]
+fn mix_scene_audio(
+    out: &mut [f32],
+    base: usize,
+    total: usize,
+    obj: &TimelineObject,
+    fps: f64,
+    scenes: &[Scene],
+    stack: &mut Vec<usize>,
+    cache: &mut AudioCache,
+    resolve: &dyn Fn(&str) -> PathBuf,
+) {
+    let Some(src) = obj.source() else { return };
+    let Some(index) = scene_index(src, scenes) else { return };
+    if stack.contains(&index) || stack.len() >= MAX_SCENE_DEPTH {
+        return;
+    }
+    let child = &scenes[index];
+    let child_fps = child.settings.frame_rate.as_f64().max(1.0);
+    let pb = ScenePlayback::of(src, 0);
+    let obj_start = frame_to_sample(obj.frame_start, fps);
+    let lo = obj_start.max(base);
+    let hi = frame_to_sample(obj.frame_end + 1, fps).min(base + total);
+    if lo >= hi {
+        return;
+    }
+    let start_samples = pb.start / child_fps * SAMPLE_RATE as f64;
+    let pos = |s: usize| (start_samples + (s - obj_start) as f64 * pb.speed) as usize;
+    let child_len = match child.settings.length {
+        0 => usize::MAX,
+        len => frame_to_sample(len, child_fps),
+    };
+    let looping = pb.looping && child_len != usize::MAX;
+    // 子シーンでミックスする範囲（サンプル）
+    let (c_lo, c_hi) = if looping { (0, child_len) } else { (pos(lo), (pos(hi - 1) + 1).min(child_len)) };
+    if c_lo >= c_hi {
+        return;
+    }
+    let to_frame = |sample: usize| (sample as f64 * child_fps / SAMPLE_RATE as f64) as Frame;
+    let (f_lo, f_hi) = (to_frame(c_lo), to_frame(c_hi).saturating_add(2));
+    stack.push(index);
+    let buf = mix_scene(child, scenes, stack, cache, f_lo, f_hi, resolve);
+    stack.pop();
+    let buf_base = frame_to_sample(f_lo, child_fps);
+
+    let play = obj.effects.iter().find(|e| e.name == "標準再生");
+    let mut cached_frame = Frame::MAX;
+    let (mut gain_l, mut gain_r) = (0.0f32, 0.0f32);
+    for s in lo..hi {
+        let rel = (((s - obj_start) as f64 * fps / SAMPLE_RATE as f64) as Frame).min(obj.length() - 1);
+        if rel != cached_frame {
+            cached_frame = rel;
+            (gain_l, gain_r) = gains(play, rel);
+        }
+        let mut p = pos(s);
+        if p >= child_len {
+            if !looping {
+                continue;
+            }
+            p %= child_len;
+        }
+        let Some(i) = p.checked_sub(buf_base).filter(|i| (i + 1) * CHANNELS <= buf.len()) else { continue };
+        let o = (s - base) * CHANNELS;
+        out[o] += buf[i * CHANNELS] * gain_l;
+        out[o + 1] += buf[i * CHANNELS + 1] * gain_r;
+    }
 }
 
 fn mix_object(out: &mut [f32], base: usize, total: usize, obj: &TimelineObject, clip: &[f32], fps: f64) {
@@ -146,10 +270,7 @@ fn mix_object(out: &mut [f32], base: usize, total: usize, obj: &TimelineObject, 
         let rel = (((s - obj_start) as f64 * fps / SAMPLE_RATE as f64) as Frame).min(obj.length() - 1);
         if rel != cached_frame {
             cached_frame = rel;
-            let volume = play.map_or(100.0, |p| p.eval("音量", rel, 100.0)) as f32 / 100.0;
-            let pan = play.map_or(0.0, |p| p.eval("左右", rel, 0.0)).clamp(-100.0, 100.0) as f32 / 100.0;
-            gain_l = volume * (1.0 - pan).min(1.0);
-            gain_r = volume * (1.0 + pan).min(1.0);
+            (gain_l, gain_r) = gains(play, rel);
             start_sec = src.eval("再生位置", rel, 0.0);
             speed = (src.eval("再生速度", rel, 100.0) / 100.0).max(0.0);
         }
@@ -170,7 +291,7 @@ fn mix_object(out: &mut [f32], base: usize, total: usize, obj: &TimelineObject, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use au2_core::{Scene, SceneSettings, Track};
+    use au2_core::{Project, Scene, SceneSettings, Track};
 
     fn scene() -> Scene {
         // 30fps、48000Hz → 1 フレーム = 1600 サンプル
@@ -283,6 +404,86 @@ mod tests {
         s.insert_object(1, TimelineObject::new_audio(0, 9, "missing-and-undecodable.wav"));
         s.layers[0].visible = false;
         assert!(mix(&s, &mut cache, 0, 10, &resolve).iter().all(|&v| v == 0.0));
+    }
+
+    /// Root（空）と、`clip` を 0..=len-1 フレームに置いた子シーン（長さ `len` フレーム）。
+    fn project_with_child(clip: &str, len: Frame) -> Project {
+        let mut child = Scene::new("Scene1", SceneSettings { length: len, ..Default::default() });
+        child.insert_object(0, TimelineObject::new_audio(0, len - 1, clip));
+        let mut p = Project::new("p", scene());
+        p.scenes.push(child);
+        p
+    }
+
+    #[test]
+    fn scene_audio_plays_the_other_scene() {
+        let mut cache = AudioCache::default();
+        cache.insert("a.wav", constant_clip(0.5, 5.0));
+        let mut p = project_with_child("a.wav", 30);
+        p.scenes[1].layers[0].objects[0].frame_end = 59; // 子シーンの長さより長く置いた音も、長さで切れる
+        let mut obj = TimelineObject::new_scene_audio(10, 49, 1);
+        set(&mut obj, "標準再生", "音量", 50.0);
+        p.scenes[0].insert_object(0, obj);
+        let out = mix_project(&p, 0, &mut cache, 0, 50, &resolve);
+        let at = |frame: usize| out[frame * 1600 * 2];
+        assert_eq!(at(5), 0.0, "範囲前は無音");
+        assert!((at(10) - 0.25).abs() < 1e-6, "子シーンの音 × 50%: {}", at(10));
+        assert!((at(39) - 0.25).abs() < 1e-6, "子の最後のフレーム");
+        assert_eq!(at(40), 0.0, "子シーンの長さ（30 フレーム）を越えたら無音");
+        // Project を渡さない mix() では鳴らない
+        assert!(mix(&p.scenes[0], &mut cache, 0, 50, &resolve).iter().all(|&v| v == 0.0));
+        assert!(mix_project(&p, 9, &mut cache, 0, 50, &resolve).is_empty(), "存在しないシーン");
+    }
+
+    #[test]
+    fn scene_audio_start_speed_and_loop() {
+        // 子シーン: 前半 1 秒が 0.1、後半 1 秒が 0.9（60 フレーム）
+        let mut clip = constant_clip(0.1, 1.0);
+        clip.extend(constant_clip(0.9, 1.0));
+        let mut cache = AudioCache::default();
+        cache.insert("a.wav", clip);
+        let base = project_with_child("a.wav", 60);
+
+        let mut p = base.clone();
+        let mut obj = TimelineObject::new_scene_audio(0, 59, 1);
+        set(&mut obj, "シーン(音声)", "再生位置", 31.0); // 子の 30 フレーム目 = 1 秒目から
+        p.scenes[0].insert_object(0, obj.clone());
+        let out = mix_project(&p, 0, &mut cache, 0, 60, &resolve);
+        let at = |sec: f64| out[(sec * SAMPLE_RATE as f64) as usize * 2];
+        assert!((at(0.1) - 0.9).abs() < 1e-6, "{}", at(0.1));
+        assert_eq!(at(1.5), 0.0, "子シーンの終端を越えたら無音");
+
+        set(&mut obj, "シーン(音声)", "ループ再生", 1.0);
+        let mut p = base.clone();
+        p.scenes[0].insert_object(0, obj);
+        let out = mix_project(&p, 0, &mut cache, 0, 60, &resolve);
+        let at = |sec: f64| out[(sec * SAMPLE_RATE as f64) as usize * 2];
+        assert!((at(1.5) - 0.1).abs() < 1e-6, "ループで子の先頭（0.1）に戻る: {}", at(1.5));
+
+        let mut p = base;
+        let mut obj = TimelineObject::new_scene_audio(0, 29, 1);
+        set(&mut obj, "シーン(音声)", "再生速度", 200.0);
+        p.scenes[0].insert_object(0, obj);
+        let out = mix_project(&p, 0, &mut cache, 0, 30, &resolve);
+        let at = |sec: f64| out[(sec * SAMPLE_RATE as f64) as usize * 2];
+        assert!((at(0.25) - 0.1).abs() < 1e-6);
+        assert!((at(0.75) - 0.9).abs() < 1e-6, "2 倍速: 0.75 秒は子の 1.5 秒: {}", at(0.75));
+    }
+
+    #[test]
+    fn recursive_scene_audio_terminates_and_plays_once() {
+        let mut cache = AudioCache::default();
+        cache.insert("a.wav", constant_clip(0.25, 2.0));
+        let mut p = project_with_child("a.wav", 30);
+        // Root → 自分自身、Scene1 → Scene2 → Scene1 の循環
+        p.scenes[0].insert_object(0, TimelineObject::new_scene_audio(0, 29, 0));
+        p.scenes[0].insert_object(1, TimelineObject::new_scene_audio(0, 29, 1));
+        p.scenes[1].insert_object(1, TimelineObject::new_scene_audio(0, 29, 2));
+        let mut scene2 = Scene::new("Scene2", SceneSettings { length: 30, ..Default::default() });
+        scene2.insert_object(0, TimelineObject::new_scene_audio(0, 29, 1));
+        p.scenes.push(scene2);
+        let out = mix_project(&p, 0, &mut cache, 0, 30, &resolve);
+        assert!((out[1600 * 2] - 0.25).abs() < 1e-6, "Scene1 の音が 1 回だけ: {}", out[1600 * 2]);
     }
 
     #[test]
