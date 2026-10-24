@@ -1,13 +1,18 @@
 //! エディタの状態（UI から独立したアプリケーション状態）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use au2_core::{Frame, ObjectId, Scene, SceneSettings, TimelineObject};
 use au2_exo::TextEncoding;
-use au2_media::{MediaCache, MediaKind};
+use au2_media::{MediaCache, MediaKind, RgbaFrame};
+use au2_render::{MediaSource, Renderer};
 use au2_plugin::PluginRegistry;
+
+use crate::history::History;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 /// 同梱サンプル（Shift_JIS）。
@@ -66,6 +71,108 @@ impl Default for TimelineView {
     }
 }
 
+/// プレビュー用の GPU 描画。eframe の wgpu デバイスを共有し、描画結果を読み戻さずに画面へ出す。
+pub struct PreviewRenderer {
+    pub renderer: Renderer,
+    render_state: eframe::egui_wgpu::RenderState,
+    /// egui に登録済みのフレームバッファ（テクスチャ ID と、登録時の世代番号）
+    texture: Option<(egui::TextureId, u64)>,
+    /// 直近の描画エラー（画面に出す。同じエラーを毎フレームログに出さないためにも使う）
+    pub last_error: Option<String>,
+}
+
+impl PreviewRenderer {
+    pub fn new(render_state: eframe::egui_wgpu::RenderState) -> Self {
+        let gpu = au2_render::Gpu::from_parts(
+            render_state.device.clone(),
+            render_state.queue.clone(),
+            &render_state.adapter,
+        );
+        let mut renderer = Renderer::new(gpu);
+        match renderer.load_system_font() {
+            Some(path) => log::info!("プレビュー用フォント: {path}"),
+            None => log::warn!("プレビュー用の日本語フォントが見つかりません（テキストは描画されません）"),
+        }
+        Self { renderer, render_state, texture: None, last_error: None }
+    }
+}
+
+/// 相対パス・サンプル名を解決してから `MediaCache` に渡す供給元。
+struct ResolvingMedia<'a>(&'a mut MediaCache);
+
+impl MediaSource for ResolvingMedia<'_> {
+    fn frame(&mut self, path: &str, media_frame: u32, time_sec: f64) -> Option<&RgbaFrame> {
+        let resolved = resolve_media_path(path);
+        MediaSource::frame(self.0, &resolved.to_string_lossy(), media_frame, time_sec)
+    }
+
+    fn native_size(&mut self, path: &str) -> Option<(u32, u32)> {
+        let resolved = resolve_media_path(path);
+        MediaSource::native_size(self.0, &resolved.to_string_lossy())
+    }
+
+    fn prepare(&mut self, path: &str) {
+        let resolved = resolve_media_path(path);
+        MediaSource::prepare(self.0, &resolved.to_string_lossy());
+    }
+
+    fn duration_secs(&mut self, path: &str) -> Option<f64> {
+        let resolved = resolve_media_path(path);
+        MediaSource::duration_secs(self.0, &resolved.to_string_lossy())
+    }
+}
+
+fn resolve_media_path(path_str: &str) -> PathBuf {
+    let mut path = PathBuf::from(path_str);
+    if !path.exists() {
+        if let Some(resolved) = resolve_app_path(path_str) {
+            path = resolved;
+        } else if path_str.ends_with("sample.mp4") {
+            if let Some(sample_vid) = resolve_app_path("samples/sample_video.mp4") {
+                path = sample_vid;
+            }
+        }
+    }
+    path
+}
+
+/// 再生用の音声（ミックス済みバッファを cpal で鳴らす）。
+pub struct AudioState {
+    player: au2_audio::AudioPlayer,
+    cache: au2_audio::AudioCache,
+    /// 現在のバッファが終わるフレーム（含まない）。近づいたら続きをミックスし直す
+    window_end: Frame,
+    /// シーク直後などの鳴らし直しを少し待つ（ドラッグ中に毎フレームミックスし直さないため）
+    restart_at: Option<Instant>,
+}
+
+impl AudioState {
+    fn new() -> Self {
+        Self {
+            player: au2_audio::AudioPlayer::new(),
+            cache: au2_audio::AudioCache::new(),
+            window_end: 0,
+            restart_at: None,
+        }
+    }
+}
+
+/// 1 回にミックスする長さ（秒）。長いほどミックス 1 回が重く、短いほど継ぎ目（鳴らし直し）が増える。
+const AUDIO_WINDOW_SECS: f64 = 30.0;
+/// 窓の終わりまで残りこの秒数になったら、続きをミックスし直す。
+const AUDIO_REFILL_MARGIN_SECS: f64 = 2.0;
+/// シーク操作が止まってから鳴らし直すまでの待ち時間。
+const AUDIO_RESTART_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// バックグラウンドで動いている動画書き出し。
+pub struct ExportJob {
+    done: Arc<AtomicU32>,
+    total: Arc<AtomicU32>,
+    cancel: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Result<(), au2_export::ExportError>>,
+    output: PathBuf,
+}
+
 pub struct EditorState {
     pub scene: Scene,
     /// 現在のプロジェクトファイルパス（`.aup` または `.exo`）
@@ -88,6 +195,14 @@ pub struct EditorState {
     /// デコード済み RGBA フレームの GPU テクスチャキャッシュ
     textures: HashMap<(PathBuf, u32), (TextureHandle, [usize; 2])>,
     pub dirty: bool,
+    /// GPU プレビュー描画（起動時に eframe から wgpu を受け取れた場合のみ）
+    pub preview: Option<PreviewRenderer>,
+    pub audio: AudioState,
+    /// Undo / Redo（`scene` のスナップショット履歴）
+    pub history: History<Scene>,
+    pub export: Option<ExportJob>,
+    /// 子ウィンドウ（マルチウィンドウ表示）でマウスが押されているか。Undo の確定を保留するのに使う
+    pub child_pointer_down: bool,
 }
 
 fn resolve_app_path(rel: &str) -> Option<PathBuf> {
@@ -95,7 +210,13 @@ fn resolve_app_path(rel: &str) -> Option<PathBuf> {
     if local.exists() {
         return Some(local);
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = current_exe_resolved() {
+        // macOS の .app バンドル: Contents/MacOS/openavi → Contents/Resources/<rel>
+        if let Some(candidate) = bundle_resources_dir(&exe).map(|dir| dir.join(rel)) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
         let mut cur = exe.parent();
         for _ in 0..4 {
             if let Some(dir) = cur {
@@ -110,8 +231,71 @@ fn resolve_app_path(rel: &str) -> Option<PathBuf> {
     None
 }
 
+/// シンボリックリンク経由で起動された場合も実体のパスを返します。
+fn current_exe_resolved() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// 実行ファイルが `*.app/Contents/MacOS/` 内にある場合、その `Contents/Resources` を返します。
+fn bundle_resources_dir(exe: &Path) -> Option<PathBuf> {
+    let macos_dir = exe.parent()?;
+    let contents = macos_dir.parent()?;
+    let is_bundle = macos_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && contents.parent()?.extension()? == "app";
+    is_bundle.then(|| contents.join("Resources"))
+}
+
 fn default_plugin_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = macos_user_plugin_dir() {
+        return dir;
+    }
     resolve_app_path("plugins").unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
+/// .app から起動した場合は、署名済みバンドルを書き換えないよう
+/// `~/Library/Application Support/OpenAvi/plugins` をプラグインフォルダとして使います。
+/// 初回起動時およびアプリ更新時に、まだ無い同梱プラグインをコピーします（ユーザーの編集は上書きしません）。
+#[cfg(target_os = "macos")]
+fn macos_user_plugin_dir() -> Option<PathBuf> {
+    let exe = current_exe_resolved().ok()?;
+    let bundled = bundle_resources_dir(&exe)?.join("plugins");
+    let home = std::env::var_os("HOME")?;
+    let user_dir = PathBuf::from(home).join("Library/Application Support/OpenAvi/plugins");
+    if let Err(e) = std::fs::create_dir_all(&user_dir) {
+        log::warn!("プラグインフォルダを作成できません: {e}");
+        return None;
+    }
+    // 同梱プラグインの同期済みバージョン。全件コピーに成功した場合のみ更新し、失敗時は次回起動で再試行する
+    let marker = user_dir.join(".bundled-version");
+    let version = env!("CARGO_PKG_VERSION");
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(version) {
+        let mut all_ok = true;
+        match std::fs::read_dir(&bundled) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    let dst = user_dir.join(entry.file_name());
+                    if src.is_file() && !dst.exists() {
+                        if let Err(e) = std::fs::copy(&src, &dst) {
+                            log::warn!("同梱プラグインをコピーできません ({}): {e}", src.display());
+                            all_ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("同梱プラグインフォルダを読み込めません: {e}");
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            let _ = std::fs::write(&marker, version);
+        }
+    }
+    Some(user_dir)
 }
 
 fn initial_sources() -> Vec<SourceMediaItem> {
@@ -132,8 +316,10 @@ fn initial_sources() -> Vec<SourceMediaItem> {
 
 impl Default for EditorState {
     fn default() -> Self {
+        let scene = Scene::new("Root", SceneSettings::default());
         Self {
-            scene: Scene::new("Root", SceneSettings::default()),
+            history: History::new(&scene),
+            scene,
             file_path: None,
             encoding: TextEncoding::ShiftJis,
             frame: 0,
@@ -149,11 +335,43 @@ impl Default for EditorState {
             selected_source: None,
             textures: HashMap::new(),
             dirty: false,
+            preview: None,
+            audio: AudioState::new(),
+            export: None,
+            child_pointer_down: false,
         }
     }
 }
 
 impl EditorState {
+    /// 現在フレームをプレビュー用に描画し、egui で表示できるテクスチャを返します。
+    pub fn render_preview(&mut self) -> Option<egui::TextureId> {
+        let pv = self.preview.as_mut()?;
+        if let Err(e) = pv.renderer.render_to_framebuffer(&self.scene, self.frame, &mut ResolvingMedia(&mut self.media)) {
+            let message = e.to_string();
+            if pv.last_error.as_deref() != Some(&message) {
+                log::warn!("プレビュー描画に失敗しました: {message}");
+            }
+            pv.last_error = Some(message);
+            return None;
+        }
+        pv.last_error = None;
+        let generation = pv.renderer.framebuffer_generation();
+        let view = pv.renderer.framebuffer_view()?;
+        let mut egui_renderer = pv.render_state.renderer.write();
+        let device = &pv.render_state.device;
+        let id = match pv.texture {
+            Some((id, g)) if g == generation => id,
+            Some((id, _)) => {
+                egui_renderer.update_egui_texture_from_wgpu_texture(device, view, eframe::wgpu::FilterMode::Linear, id);
+                id
+            }
+            None => egui_renderer.register_native_texture(device, view, eframe::wgpu::FilterMode::Linear),
+        };
+        pv.texture = Some((id, generation));
+        Some(id)
+    }
+
     /// 編集可能な最終フレーム。
     pub fn last_frame(&self) -> Frame {
         self.scene.settings.length.max(self.scene.content_end()).max(1) - 1
@@ -163,6 +381,7 @@ impl EditorState {
         self.frame = frame.min(self.last_frame());
         if self.playing {
             self.play_origin = Some((Instant::now(), self.frame));
+            self.request_audio_restart();
         }
     }
 
@@ -174,6 +393,99 @@ impl EditorState {
     pub fn toggle_play(&mut self) {
         self.playing = !self.playing;
         self.play_origin = self.playing.then(|| (Instant::now(), self.frame));
+        self.start_audio_now();
+    }
+
+    /// 現在フレームから音声を今すぐ鳴らし直します（停止中なら止めるだけ）。
+    fn start_audio_now(&mut self) {
+        self.audio.player.stop();
+        self.audio.restart_at = None;
+        if !self.playing {
+            return;
+        }
+        let fps = self.scene.settings.frame_rate.as_f64();
+        let from = self.frame;
+        let end = (self.last_frame() + 1).min(from.saturating_add((AUDIO_WINDOW_SECS * fps) as Frame));
+        self.audio.window_end = end;
+        let mixed = au2_audio::mix(&self.scene, &mut self.audio.cache, from, end, &resolve_media_path);
+        if mixed.iter().all(|&v| v == 0.0) {
+            return;
+        }
+        match self.audio.player.play(Arc::new(mixed)) {
+            // デコードとミックスに時間がかかった分だけ映像が先に進んでいるので、音が鳴り始めた時刻に合わせ直す
+            Ok(()) => self.play_origin = Some((Instant::now(), from)),
+            Err(e) => log::warn!("音声を再生できません: {e}"),
+        }
+    }
+
+    /// シークや編集で音の位置が変わった。古い音は止め、操作が落ち着いてから鳴らし直す。
+    fn request_audio_restart(&mut self) {
+        self.audio.player.stop();
+        self.audio.restart_at = Some(Instant::now());
+    }
+
+    /// 再生中の音声の保守（毎フレーム）: 予約された鳴らし直しと、窓が尽きる前の続きのミックス。
+    fn service_audio(&mut self) {
+        if !self.playing {
+            return;
+        }
+        if let Some(t) = self.audio.restart_at {
+            if t.elapsed() >= AUDIO_RESTART_DEBOUNCE {
+                self.start_audio_now();
+            }
+            return;
+        }
+        let fps = self.scene.settings.frame_rate.as_f64();
+        let margin = (AUDIO_REFILL_MARGIN_SECS * fps) as Frame;
+        if self.audio.window_end <= self.last_frame() && self.frame.saturating_add(margin) >= self.audio.window_end {
+            self.start_audio_now();
+        }
+    }
+
+    /// アプリ終了時の後始末: 音を止め、書き出し中なら止めて終わるのを待つ（一時ファイルを残さない）。
+    pub fn shutdown(&mut self) {
+        self.audio.player.stop();
+        if let Some(job) = self.export.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            let _ = job.handle.join();
+        }
+    }
+
+    /// ファイルを開いた・新規作成した直後の後始末（履歴と音声を捨てる）。
+    fn scene_replaced(&mut self) {
+        self.history.reset(&self.scene);
+        self.audio.player.stop();
+    }
+
+    /// 毎フレーム、UI の最後に呼ぶ。`stable` はマウスボタンが押されていない（操作の途中でない）こと。
+    pub fn observe_history(&mut self, stable: bool) {
+        if self.history.observe(&self.scene, stable) {
+            self.dirty = true;
+        }
+    }
+
+    pub fn undo(&mut self) {
+        if self.history.undo(&mut self.scene) {
+            self.after_history_jump("元に戻しました");
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if self.history.redo(&mut self.scene) {
+            self.after_history_jump("やり直しました");
+        }
+    }
+
+    fn after_history_jump(&mut self, message: &str) {
+        self.dirty = true;
+        self.status = message.into();
+        if self.selected.is_some_and(|id| self.scene.find(id).is_none()) {
+            self.selected = None;
+        }
+        self.frame = self.frame.min(self.last_frame());
+        if self.playing {
+            self.request_audio_restart();
+        }
     }
 
     /// 再生中なら経過時間からフレームを進めます（末尾でループ）。
@@ -181,11 +493,96 @@ impl EditorState {
         let Some((origin, start)) = self.play_origin.filter(|_| self.playing) else { return };
         let fps = self.scene.settings.frame_rate;
         let mut f = start + fps.seconds_to_frame(origin.elapsed().as_secs_f64());
-        if f > self.last_frame() {
+        let wrapped = f > self.last_frame();
+        if wrapped {
             f = 0;
             self.play_origin = Some((Instant::now(), 0));
         }
         self.frame = f;
+        if wrapped {
+            self.start_audio_now();
+        }
+        self.service_audio();
+    }
+
+    pub fn export_running(&self) -> bool {
+        self.export.is_some()
+    }
+
+    /// 書き出し先を選んで、バックグラウンドで動画（MP4 / H.264 + AAC）を書き出します。
+    pub fn export_video_dialog(&mut self) {
+        if self.export.is_some() {
+            self.status = "すでに書き出し中です".into();
+            return;
+        }
+        let Some(mut output) = rfd::FileDialog::new()
+            .set_title("動画を書き出し")
+            .add_filter("MP4 動画 (H.264 + AAC)", &["mp4"])
+            .set_file_name("openavi.mp4")
+            .save_file()
+        else {
+            return;
+        };
+        if output.extension().is_none() {
+            output.set_extension("mp4");
+        }
+        let scene = self.scene.clone();
+        let (done, total, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)));
+        let (d, t, c, out) = (done.clone(), total.clone(), cancel.clone(), output.clone());
+        let handle = std::thread::spawn(move || {
+            // 書き出しはプレビューとは別の GPU デバイス・別のメディアキャッシュで動かす
+            let mut renderer = Renderer::new(au2_render::Gpu::headless()?);
+            renderer.load_system_font();
+            let mut cache = MediaCache::new();
+            cache.set_max_decode_width(u32::MAX); // 書き出しは動画を原寸でデコードする
+            cache.set_retry_backoff(false); // 失敗後の待ち時間を置くと、その間のフレームがプレースホルダで書き出されてしまう
+            let mut progress = |n: u32, all: u32| {
+                d.store(n, Ordering::Relaxed);
+                t.store(all, Ordering::Relaxed);
+                !c.load(Ordering::Relaxed)
+            };
+            au2_export::export_video(
+                &scene,
+                &au2_export::ExportOptions::new(out),
+                &mut renderer,
+                &mut ResolvingMedia(&mut cache),
+                &resolve_media_path,
+                &mut progress,
+            )
+        });
+        self.status = format!("書き出しを開始しました: {}", output.display());
+        self.export = Some(ExportJob { done, total, cancel, handle, output });
+    }
+
+    pub fn cancel_export(&mut self) {
+        if let Some(job) = &self.export {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 書き出しの進捗をステータスに反映し、終わっていれば結果を報告します。毎フレーム呼ぶ。
+    pub fn poll_export(&mut self) {
+        let Some(job) = &self.export else { return };
+        if !job.handle.is_finished() {
+            let (d, t) = (job.done.load(Ordering::Relaxed), job.total.load(Ordering::Relaxed));
+            self.status = format!("書き出し中… {d} / {t} フレーム");
+            return;
+        }
+        let job = self.export.take().expect("確認済み");
+        self.status = match job.handle.join() {
+            Ok(Ok(())) => format!("書き出しが完了しました: {}", job.output.display()),
+            Ok(Err(au2_export::ExportError::Cancelled)) => "書き出しをキャンセルしました".into(),
+            // 書き出し自体は成功している。完成したファイルの場所を伝える（「失敗」とは表示しない）
+            Ok(Err(e @ au2_export::ExportError::Finalize { .. })) => {
+                log::warn!("{e}");
+                e.to_string()
+            }
+            Ok(Err(e)) => {
+                log::error!("書き出しに失敗: {e}");
+                format!("書き出しに失敗しました: {e}")
+            }
+            Err(_) => "書き出しスレッドが異常終了しました".into(),
+        };
     }
 
     pub fn new_scene(&mut self) {
@@ -195,8 +592,16 @@ impl EditorState {
             timeline: std::mem::take(&mut self.timeline),
             plugins,
             sources,
+            preview: self.preview.take(),
+            audio: AudioState {
+                player: std::mem::take(&mut self.audio.player),
+                cache: std::mem::take(&mut self.audio.cache),
+                ..AudioState::new()
+            },
+            export: self.export.take(),
             ..Self::default()
         };
+        self.audio.player.stop();
         self.status = "新規プロジェクトを作成しました".into();
     }
 
@@ -249,16 +654,7 @@ impl EditorState {
         frame_index: u32,
         time_sec: f64,
     ) -> Option<(egui::TextureId, [usize; 2])> {
-        let mut path = PathBuf::from(path_str);
-        if !path.exists() {
-            if let Some(resolved) = resolve_app_path(path_str) {
-                path = resolved;
-            } else if path_str.ends_with("sample.mp4") {
-                if let Some(sample_vid) = resolve_app_path("samples/sample_video.mp4") {
-                    path = sample_vid;
-                }
-            }
-        }
+        let path = resolve_media_path(path_str);
         // 静止画の場合は frame_index = 0 で共通化
         let key_frame = match MediaKind::from_path(&path) {
             Some(MediaKind::Image) => 0,
@@ -270,6 +666,10 @@ impl EditorState {
         }
 
         let rgba = self.media.get_frame(&path, key_frame, time_sec)?;
+        // サムネイルは GPU の最大テクスチャサイズ（egui 既定 8192）を超えると落ちるので、縮小してから渡す
+        let limit = ctx.input(|i| i.max_texture_side).min(2048) as u32;
+        let fitted = rgba.fit_within(limit);
+        let rgba = fitted.as_ref().unwrap_or(rgba);
         let size = [rgba.width as usize, rgba.height as usize];
         let color_img = ColorImage::from_rgba_unmultiplied(size, &rgba.pixels);
 
@@ -370,6 +770,7 @@ impl EditorState {
                     doc.scene.object_count()
                 );
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
                 self.selected = None;
@@ -398,6 +799,7 @@ impl EditorState {
                     doc.scene.object_count()
                 );
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
                 self.selected = None;
@@ -430,6 +832,7 @@ impl EditorState {
                     log::warn!("{w}");
                 }
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.encoding = doc.encoding;
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
@@ -625,5 +1028,102 @@ impl EditorState {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_redo_restores_scene_and_drops_stale_selection() {
+        let mut st = EditorState::default();
+        let before = st.scene.clone();
+        let obj = TimelineObject::new_shape(0, 29, 1, "ff0000");
+        let id = obj.id;
+        st.scene.insert_object(0, obj);
+        st.selected = Some(id);
+        st.observe_history(false);
+        assert!(!st.history.can_undo(), "操作中は記録しない");
+        st.observe_history(true);
+        assert!(st.history.can_undo());
+
+        st.undo();
+        assert_eq!(st.scene, before);
+        assert_eq!(st.selected, None, "消えたオブジェクトの選択は外れる");
+        st.redo();
+        assert!(st.scene.find(id).is_some());
+    }
+
+    #[test]
+    fn new_scene_keeps_nothing_to_undo() {
+        let mut st = EditorState::default();
+        st.scene.insert_object(0, TimelineObject::new_shape(0, 9, 1, "00ff00"));
+        st.observe_history(true);
+        st.new_scene();
+        assert!(!st.history.can_undo());
+    }
+
+    #[test]
+    fn audio_window_is_refilled_before_it_runs_out() {
+        let mut st = EditorState::default();
+        st.scene.settings.length = 3000; // 100 秒 @30fps
+        st.toggle_play();
+        assert_eq!(st.audio.window_end, 900, "最初の窓は 30 秒");
+
+        st.frame = 800;
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 900, "まだ余裕がある");
+        st.frame = 850; // 残り 50 フレーム（2 秒 = 60 フレーム未満）
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 850 + 900, "続きをミックスし直した");
+
+        st.frame = 2999; // 最後の窓は終端までなので、それ以上は鳴らし直さない
+        st.set_frame(2400);
+        st.audio.restart_at = Instant::now().checked_sub(AUDIO_RESTART_DEBOUNCE * 2);
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 3000);
+        st.frame = 2999;
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 3000);
+    }
+
+    #[test]
+    fn seeking_while_playing_is_debounced() {
+        let mut st = EditorState::default();
+        st.scene.settings.length = 3000;
+        st.toggle_play();
+        st.set_frame(1000);
+        assert!(st.audio.restart_at.is_some(), "シークは予約される");
+        // 実時間に頼らず、「予約されたばかり」と「待ち時間を過ぎた」状態を直接作って確かめる（負荷の高い環境でも安定）
+        st.audio.restart_at = Some(Instant::now() + std::time::Duration::from_secs(3600));
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 900, "待ち時間の間は鳴らし直さない");
+        st.audio.restart_at = Instant::now().checked_sub(AUDIO_RESTART_DEBOUNCE * 2);
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 1900);
+        assert!(st.audio.restart_at.is_none());
+    }
+
+    /// プレビュー・書き出しが使う `ResolvingMedia` は、`MediaSource` の省略可能なメソッド（本来のサイズ・長さ）も
+    /// 必ず転送すること。転送し忘れるとトレイトの既定値（`None`）が返り、縮小デコード時のサイズ崩れや
+    /// ループ再生の無効化が静かに起きる。
+    #[test]
+    fn resolving_media_forwards_every_optional_source_method() {
+        let mut cache = MediaCache::new();
+        if !cache.has_ffmpeg() || !cache.has_ffprobe() {
+            return;
+        }
+        cache.set_max_decode_width(160); // デコードを縮小させ、本来のサイズとの違いが出るようにする
+        let mut media = ResolvingMedia(&mut cache);
+        // 相対パス（サンプル名）は resolve_media_path が実ファイルに解決する
+        let path = "samples/sample_video.mp4";
+        media.prepare(path);
+        assert!(media.duration_secs(path).is_some(), "prepare が転送され、フレームを要求しなくても長さが分かる");
+        let frame = media.frame(path, 0, 0.0).expect("サンプル動画をデコードできる");
+        assert_eq!((frame.width, frame.height), (160, 90));
+        assert_eq!(media.native_size(path), Some((320, 180)), "本来のサイズが転送される");
+        let duration = media.duration_secs(path).expect("長さが転送される");
+        assert!((duration - 2.0).abs() < 0.1, "長さ {duration}");
     }
 }

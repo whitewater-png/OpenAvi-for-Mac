@@ -1,0 +1,20 @@
+[package]
+name = "au2-render"
+description = "OpenAvi headless GPU compositor (preview and export share this renderer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+au2-core.workspace = true
+au2-media.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+ab_glyph.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+au2-exo.workspace = true
+image.workspace = true
