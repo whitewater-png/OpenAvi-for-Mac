@@ -370,4 +370,17 @@ mod tests {
         assert_eq!(i.kind, MoveKind::Linear);
         assert_eq!(i.easing, Easing::EaseInOut);
     }
+
+    #[test]
+    fn extended_move_codes_roundtrip_through_interpolation() {
+        let amount = interpolation_from_code(5 | FLAG_DECEL, None, Some("30".into()));
+        assert_eq!(amount.kind, MoveKind::MoveAmount);
+        assert_eq!(amount.easing, Easing::EaseOut);
+        assert_eq!(amount.param.as_deref(), Some("30"));
+        let random = interpolation_from_code(6, None, Some("2,9".into()));
+        assert_eq!(random.kind, MoveKind::Random);
+        let repeat = interpolation_from_code(7 | FLAG_ACCEL, None, Some("3".into()));
+        assert_eq!(repeat.kind, MoveKind::repeat());
+        assert_eq!(repeat.easing, Easing::EaseIn);
+    }
 }

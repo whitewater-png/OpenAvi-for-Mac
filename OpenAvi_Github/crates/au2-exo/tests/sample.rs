@@ -86,3 +86,21 @@ fn roundtrip_is_stable() {
 fn missing_header_is_error() {
     assert!(parse_exo_str("[0]\nstart=1\nend=2\nlayer=1\n").is_err());
 }
+
+#[test]
+fn extended_move_methods_roundtrip_exactly() {
+    let src = "[exedit]\nwidth=640\nheight=360\nrate=30\nscale=1\nlength=60\naudio_rate=44100\naudio_ch=2\n\
+[0]\nstart=1\nend=30\nlayer=1\noverlay=1\ncamera=0\n\
+[0.0]\n_name=標準描画\nX=0.0,100.0,69,25\nY=0.0,50.0,6,3,7\nZ=0.0,20.0,39,4\n\
+[0.1]\n_name=標準描画\n";
+    let first = parse_exo_str(src).unwrap();
+    let out1 = write_exo_string(&first.scene);
+    let second = parse_exo_str(&out1).unwrap();
+    let out2 = write_exo_string(&second.scene);
+    assert_eq!(out1, out2);
+    for (k, code, param) in [("X", "69", "25"), ("Y", "6", "3,7"), ("Z", "39", "4")] {
+        let needle = format!("{k}=");
+        let line = out1.lines().find(|l| l.starts_with(&needle)).expect(k);
+        assert!(line.ends_with(&format!(",{code},{param}")), "{line}");
+    }
+}
