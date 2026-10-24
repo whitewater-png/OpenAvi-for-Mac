@@ -9,6 +9,7 @@ use au2_media::RgbaFrame;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::blend::{self, BlendMode};
 use crate::eval::{eval_draw_params, DrawParams};
 use crate::gpu::Gpu;
 use crate::media::MediaSource;
@@ -29,6 +30,9 @@ const SHAPE_CIRCLE: u32 = 0;
 const SHAPE_BOX: u32 = 1;
 const SHAPE_POLYGON: u32 = 2;
 const SHAPE_STAR: u32 = 3;
+
+/// クリッピングのマスク（上のオブジェクトの不透明度）のフォーマット。
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// 欠落メディアのプレースホルダ色（プレビューと同じ）。
 const PLACEHOLDER_COLOR: [f32; 3] = [60.0 / 255.0, 70.0 / 255.0, 90.0 / 255.0];
@@ -79,8 +83,20 @@ struct TexEntry {
 }
 
 enum Op {
-    Sprite { offset: u32, tex: Option<Arc<TexEntry>> },
+    Sprite { offset: u32, tex: Option<Arc<TexEntry>>, path: SpritePath },
+    /// クリッピング元（上のオブジェクト）の不透明度をマスクへ描く。直後の `SpritePath::Ext` のスプライトが読む
+    ClipMask { offset: u32, tex: Option<Arc<TexEntry>> },
     ColorCorrection { offset: u32 },
+}
+
+/// スプライトの描画経路。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpritePath {
+    /// 通常合成・クリッピング無し: 連続する分を 1 パスにまとめて描く
+    Fast,
+    /// 合成モード ≠ 通常、またはクリッピングあり: 1 スプライト 1 パス（`fs_ext`）。
+    /// `reads_dst` なら描く直前にフレームバッファを scratch へ写し、下地としてシェーダで読む
+    Ext { reads_dst: bool },
 }
 
 struct Targets {
@@ -93,9 +109,13 @@ struct Targets {
     /// テクスチャ間コピーが未定義動作になるため、この経路は使わない）。
     display: Option<wgpu::Texture>,
     display_view: wgpu::TextureView,
-    /// フィルタパスが読む用のコピー先（ping-pong 相手）
+    /// フィルタパス・合成モードが読む用のコピー先（ping-pong 相手）
     scratch: wgpu::Texture,
     scratch_bind_group: wgpu::BindGroup,
+    /// クリッピングのマスク（`MASK_FORMAT`）
+    mask_view: wgpu::TextureView,
+    /// `fs_ext` のグループ 2（scratch = 下地、mask）
+    sprite_ext_bind_group: wgpu::BindGroup,
     /// 読み戻し用バッファ。プレビューは読み戻さないので、最初の `render()` まで作らない
     readback: Option<wgpu::Buffer>,
     padded_row: u32,
@@ -104,6 +124,11 @@ struct Targets {
 pub struct Renderer {
     gpu: Gpu,
     sprite_pipeline: wgpu::RenderPipeline,
+    /// 合成モード・クリッピング用（`fs_ext`）
+    sprite_ext_pipeline: wgpu::RenderPipeline,
+    /// クリッピングのマスク描画用（`fs_mask`）
+    mask_pipeline: wgpu::RenderPipeline,
+    sprite_ext_layout: wgpu::BindGroupLayout,
     sprite_uniform_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -228,6 +253,60 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // --- 合成モード・クリッピング（fs_ext / fs_mask）: グループ 2 に下地（scratch）とマスクを足す ---
+        let unfilterable = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sprite_ext_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sprite dst/mask"),
+            entries: &[unfilterable(0), unfilterable(1)],
+        });
+        let sprite_ext_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sprite ext pipeline layout"),
+            bind_group_layouts: &[&sprite_uniform_layout, &texture_layout, &sprite_ext_layout],
+            push_constant_ranges: &[],
+        });
+        let sprite_variant = |label: &str,
+                              layout: &wgpu::PipelineLayout,
+                              entry_point: &str,
+                              format: wgpu::TextureFormat,
+                              blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &sprite_shader,
+                    entry_point: "vs",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &sprite_shader,
+                    entry_point,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        // 合成モードの式はシェーダで計算し、上の不透明度での混ぜ合わせは通常と同じ「over」に任せる
+        let sprite_ext_pipeline =
+            sprite_variant("sprite ext pipeline", &sprite_ext_pipeline_layout, "fs_ext", FORMAT, Some(over));
+        // マスクは毎回 0 で消してから 1 オブジェクトだけ描くので、ブレンド無しで上書きする
+        let mask_pipeline = sprite_variant("clip mask pipeline", &sprite_pipeline_layout, "fs_mask", MASK_FORMAT, None);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("sprite sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -293,6 +372,9 @@ impl Renderer {
         Self {
             gpu,
             sprite_pipeline,
+            sprite_ext_pipeline,
+            mask_pipeline,
+            sprite_ext_layout,
             sprite_uniform_layout,
             texture_layout,
             sampler,
@@ -441,9 +523,37 @@ impl Renderer {
             layout: &self.filter_src_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) }],
         });
+        let mask = make(
+            "clip mask",
+            MASK_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            &[],
+        );
+        let mask_view = mask.create_view(&wgpu::TextureViewDescriptor::default());
+        let sprite_ext_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sprite dst/mask bind group"),
+            layout: &self.sprite_ext_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view) },
+            ],
+        });
         let padded_row = align_up(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         self.generation += 1;
-        self.targets = Some(Targets { width, height, main, main_view, display, display_view, scratch, scratch_bind_group, readback: None, padded_row });
+        self.targets = Some(Targets {
+            width,
+            height,
+            main,
+            main_view,
+            display,
+            display_view,
+            scratch,
+            scratch_bind_group,
+            mask_view,
+            sprite_ext_bind_group,
+            readback: None,
+            padded_row,
+        });
         Ok(())
     }
 
@@ -506,6 +616,8 @@ impl Renderer {
         let canvas = [width as f32, height as f32];
         let fps = scene.settings.frame_rate.as_f64();
         self.bounds.clear();
+        // 上のオブジェクトでクリッピング: クリッピング元は自分の順番では描かず、すぐ下のオブジェクトのマスクになる
+        let mut clip_source: Option<(usize, SpriteUniform, Option<Arc<TexEntry>>)> = None;
 
         for (li, obj) in scene.objects_at(frame) {
             if !scene.layers[li].visible {
@@ -519,15 +631,42 @@ impl Renderer {
                     if params.alpha <= 0.0 {
                         continue;
                     }
-                    if let Some((uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
+                    if let Some((mut uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
+                        // --- 合成モード・クリッピング（docs/RENDER_DESIGN.md「合成モード・クリッピング」）---
+                        uniform.blend = [BlendMode::of_object(obj).code(), 0, 0, 0];
+                        let is_source = blend::is_clip_source(scene, li, frame);
+                        let mut mask = None;
+                        if !is_source && blend::clips_to_upper(scene, li, obj) {
+                            // すぐ上のレイヤーにマスクになるオブジェクトが無ければ描かない
+                            let Some((_, mask_uniform, mask_tex)) = clip_source.take().filter(|(sl, ..)| sl + 1 == li)
+                            else {
+                                continue;
+                            };
+                            mask = Some((mask_uniform, mask_tex));
+                            uniform.blend[1] = 1;
+                        }
                         self.bounds.insert(
                             obj.id,
                             ObjectBounds { center: uniform.center, half: uniform.half, angle: uniform.angle },
                         );
-                        let offset = sprite_bytes.len() as u32;
-                        sprite_bytes.extend_from_slice(bytemuck::bytes_of(&uniform));
-                        sprite_bytes.resize((offset + sprite_stride) as usize, 0);
-                        ops.push(Op::Sprite { offset, tex });
+                        if is_source {
+                            clip_source = Some((li, uniform, tex));
+                            continue;
+                        }
+                        let mut push_uniform = |u: &SpriteUniform| {
+                            let offset = sprite_bytes.len() as u32;
+                            sprite_bytes.extend_from_slice(bytemuck::bytes_of(u));
+                            sprite_bytes.resize((offset + sprite_stride) as usize, 0);
+                            offset
+                        };
+                        if let Some((mask_uniform, mask_tex)) = mask {
+                            ops.push(Op::ClipMask { offset: push_uniform(&mask_uniform), tex: mask_tex });
+                        }
+                        let path = match uniform.blend {
+                            [0, 0, ..] => SpritePath::Fast,
+                            [mode, ..] => SpritePath::Ext { reads_dst: mode != 0 },
+                        };
+                        ops.push(Op::Sprite { offset: push_uniform(&uniform), tex, path });
                     }
                 }
                 ObjectCategory::Filter if src.name == "色調補正" => {
@@ -601,11 +740,34 @@ impl Renderer {
             occlusion_query_set: None,
         }));
 
+        // 現在の合成結果を scratch にコピーする（フィルタ・合成モードが下地として読む）
+        let copy_to_scratch = |encoder: &mut wgpu::CommandEncoder| {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &targets.main,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &targets.scratch,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        };
+        let dummy = &self.dummy_texture;
+        fn texture_bg<'a>(tex: &'a Option<Arc<TexEntry>>, dummy: &'a Arc<TexEntry>) -> &'a wgpu::BindGroup {
+            &tex.as_ref().unwrap_or(dummy).bind_group
+        }
+
         let mut i = 0;
         while i < ops.len() {
             match &ops[i] {
-                Op::Sprite { .. } => {
-                    // 連続するスプライトは 1 パスにまとめる
+                Op::Sprite { path: SpritePath::Fast, .. } => {
+                    // 連続する通常合成のスプライトは 1 パスにまとめる
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("sprites"),
                         color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
@@ -614,32 +776,57 @@ impl Renderer {
                         occlusion_query_set: None,
                     });
                     pass.set_pipeline(&self.sprite_pipeline);
-                    while let Some(Op::Sprite { offset, tex }) = ops.get(i) {
-                        let bind_group = &tex.as_ref().unwrap_or(&self.dummy_texture).bind_group;
+                    while let Some(Op::Sprite { offset, tex, path: SpritePath::Fast }) = ops.get(i) {
                         pass.set_bind_group(0, &sprite_bg, &[*offset]);
-                        pass.set_bind_group(1, bind_group, &[]);
+                        pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
                         pass.draw(0..4, 0..1);
                         i += 1;
                     }
                 }
+                Op::Sprite { offset, tex, path: SpritePath::Ext { reads_dst } } => {
+                    // 合成モードは下地を読むので、描く直前の合成結果を scratch に写してからパスを始める
+                    if *reads_dst {
+                        copy_to_scratch(&mut encoder);
+                    }
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("sprite (blend/clip)"),
+                        color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.sprite_ext_pipeline);
+                    pass.set_bind_group(0, &sprite_bg, &[*offset]);
+                    pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
+                    pass.set_bind_group(2, &targets.sprite_ext_bind_group, &[]);
+                    pass.draw(0..4, 0..1);
+                    i += 1;
+                }
+                Op::ClipMask { offset, tex } => {
+                    // マスクを 0 で消し、クリッピング元のオブジェクトの不透明度だけを描く
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clip mask"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.mask_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.mask_pipeline);
+                    pass.set_bind_group(0, &sprite_bg, &[*offset]);
+                    pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
+                    pass.draw(0..4, 0..1);
+                    i += 1;
+                }
                 Op::ColorCorrection { offset } => {
                     // 現在の合成結果を scratch にコピーし、それを読みながら main へ書き戻す
-                    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-                    encoder.copy_texture_to_texture(
-                        wgpu::ImageCopyTexture {
-                            texture: &targets.main,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::ImageCopyTexture {
-                            texture: &targets.scratch,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        size,
-                    );
+                    copy_to_scratch(&mut encoder);
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("color correction"),
                         color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
