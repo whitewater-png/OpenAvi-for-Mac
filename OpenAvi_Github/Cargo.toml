@@ -6,6 +6,7 @@ members = [
     "crates/au2-aup",
     "crates/au2-media",
     "crates/au2-plugin",
+    "crates/au2-render",
     "crates/au2-app",
 ]
 default-members = ["crates/au2-app"]
@@ -23,6 +24,7 @@ au2-exo = { path = "crates/au2-exo" }
 au2-aup = { path = "crates/au2-aup" }
 au2-media = { path = "crates/au2-media" }
 au2-plugin = { path = "crates/au2-plugin" }
+au2-render = { path = "crates/au2-render" }
 encoding_rs = "0.8"
 thiserror = "1"
 log = "0.4"
@@ -31,6 +33,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "wayland", "x11"] }
 egui_dock = "0.14"
 rfd = "0.15"
+wgpu = "22"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
 
 [profile.dev]
 # 依存クレート（wgpu等）は最適化してプレビューの応答性を確保し、デバッグシンボル肥大化を防ぐ
