@@ -4,7 +4,7 @@
 //!
 //! - **画像ファイル**: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.gif` を `image` クレートでネイティブデコード。
 //! - **アニメーション GIF**: 全フレームを展開し、タイムラインのフレーム位置に応じてアニメーション再生。
-//! - **動画ファイル**: `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.wmv` 等を `ffmpeg` パイプライン（PATH または WinGet 領域から自動検出）で RGBA フレームへデコードし、メモリキャッシュします。
+//! - **動画ファイル**: `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.wmv` 等を `ffmpeg` パイプライン（PATH・Homebrew 等の標準パス・WinGet 領域から自動検出）で RGBA フレームへデコードし、メモリキャッシュします。
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -208,7 +208,26 @@ fn locate_ffmpeg_tools() -> (Option<PathBuf>, Option<PathBuf>) {
         return (Some(PathBuf::from("ffmpeg")), Some(PathBuf::from("ffprobe")));
     }
 
-    // 2. Windows WinGet パッケージ領域を検索
+    // 2. macOS / Linux の標準インストール先を検索
+    //    Finder から .app として起動すると PATH にシェル設定 (Homebrew 等) が反映されないため
+    #[cfg(unix)]
+    {
+        const DIRS: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"];
+        let runs = |bin: &Path| {
+            Command::new(bin)
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let find = |name: &str| DIRS.iter().map(|d| Path::new(d).join(name)).find(|p| runs(p));
+        if let Some(bin) = find("ffmpeg") {
+            return (Some(bin), find("ffprobe"));
+        }
+    }
+
+    // 3. Windows WinGet パッケージ領域を検索
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let pkg_dir = PathBuf::from(local_app_data).join("Microsoft\\WinGet\\Packages");
         if let Ok(entries) = std::fs::read_dir(pkg_dir) {

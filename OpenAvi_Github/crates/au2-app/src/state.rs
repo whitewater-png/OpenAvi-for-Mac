@@ -95,7 +95,13 @@ fn resolve_app_path(rel: &str) -> Option<PathBuf> {
     if local.exists() {
         return Some(local);
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = current_exe_resolved() {
+        // macOS の .app バンドル: Contents/MacOS/openavi → Contents/Resources/<rel>
+        if let Some(candidate) = bundle_resources_dir(&exe).map(|dir| dir.join(rel)) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
         let mut cur = exe.parent();
         for _ in 0..4 {
             if let Some(dir) = cur {
@@ -110,8 +116,71 @@ fn resolve_app_path(rel: &str) -> Option<PathBuf> {
     None
 }
 
+/// シンボリックリンク経由で起動された場合も実体のパスを返します。
+fn current_exe_resolved() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// 実行ファイルが `*.app/Contents/MacOS/` 内にある場合、その `Contents/Resources` を返します。
+fn bundle_resources_dir(exe: &Path) -> Option<PathBuf> {
+    let macos_dir = exe.parent()?;
+    let contents = macos_dir.parent()?;
+    let is_bundle = macos_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && contents.parent()?.extension()? == "app";
+    is_bundle.then(|| contents.join("Resources"))
+}
+
 fn default_plugin_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = macos_user_plugin_dir() {
+        return dir;
+    }
     resolve_app_path("plugins").unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
+/// .app から起動した場合は、署名済みバンドルを書き換えないよう
+/// `~/Library/Application Support/OpenAvi/plugins` をプラグインフォルダとして使います。
+/// 初回起動時およびアプリ更新時に、まだ無い同梱プラグインをコピーします（ユーザーの編集は上書きしません）。
+#[cfg(target_os = "macos")]
+fn macos_user_plugin_dir() -> Option<PathBuf> {
+    let exe = current_exe_resolved().ok()?;
+    let bundled = bundle_resources_dir(&exe)?.join("plugins");
+    let home = std::env::var_os("HOME")?;
+    let user_dir = PathBuf::from(home).join("Library/Application Support/OpenAvi/plugins");
+    if let Err(e) = std::fs::create_dir_all(&user_dir) {
+        log::warn!("プラグインフォルダを作成できません: {e}");
+        return None;
+    }
+    // 同梱プラグインの同期済みバージョン。全件コピーに成功した場合のみ更新し、失敗時は次回起動で再試行する
+    let marker = user_dir.join(".bundled-version");
+    let version = env!("CARGO_PKG_VERSION");
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(version) {
+        let mut all_ok = true;
+        match std::fs::read_dir(&bundled) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    let dst = user_dir.join(entry.file_name());
+                    if src.is_file() && !dst.exists() {
+                        if let Err(e) = std::fs::copy(&src, &dst) {
+                            log::warn!("同梱プラグインをコピーできません ({}): {e}", src.display());
+                            all_ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("同梱プラグインフォルダを読み込めません: {e}");
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            let _ = std::fs::write(&marker, version);
+        }
+    }
+    Some(user_dir)
 }
 
 fn initial_sources() -> Vec<SourceMediaItem> {
