@@ -486,3 +486,181 @@ fn loop_opens_the_video_before_requesting_any_frame() {
     assert_eq!(media.requested.len(), 1, "要求は 1 回だけ: {:?}", media.requested);
     assert!((media.requested[0] - 0.5).abs() < 1e-6, "要求された時刻 {}", media.requested[0]);
 }
+
+// ---- 時間制御・シーン・フレームバッファ・直前オブジェクト ----
+
+fn set_param(obj: &mut TimelineObject, key: &str, track: Track) {
+    *obj.effects[0].param_mut(key).expect("param") = au2_core::ParamValue::Track(track);
+}
+
+fn linear(from: f64, to: f64, last: u32) -> Track {
+    Track {
+        keyframes: vec![au2_core::Keyframe { frame: 0, value: from }, au2_core::Keyframe { frame: last, value: to }],
+        interpolation: Some(au2_core::Interpolation::linear()),
+        precision: 1,
+    }
+}
+
+fn white_clip() -> Clip {
+    Clip { requested: Vec::new(), frame: RgbaFrame { width: 2, height: 2, pixels: [255u8; 16].to_vec() } }
+}
+
+/// 時間制御（`ctrl_layer`）とレイヤー2 の動画を置いて `frame` を描き、動画に要求された時刻[秒]を返す。
+fn requested_time_under(r: &mut Renderer, ctrl: TimelineObject, ctrl_layer: usize, frame: u32) -> f64 {
+    let mut s = scene(8, 8); // 30fps
+    s.insert_object(ctrl_layer, ctrl);
+    s.insert_object(1, TimelineObject::new_video(0, 299, "clip.mp4"));
+    let mut clip = white_clip();
+    r.render_to_framebuffer(&s, frame, &mut clip).unwrap();
+    assert_eq!(clip.requested.len(), 1, "要求は 1 回: {:?}", clip.requested);
+    clip.requested[0]
+}
+
+#[test]
+fn time_control_remaps_the_media_time_of_lower_layers() {
+    let Some(mut r) = renderer() else { return };
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    // 既定（位置 0 → 100%）は恒等
+    let t = requested_time_under(&mut r, TimelineObject::new_time_control(0, 100), 0, 10);
+    assert!(near(t, 10.0 / 30.0), "恒等: {t}");
+    // 位置を 50% に固定 → 長さ 101 の 50% = 50 フレーム目
+    let mut freeze = TimelineObject::new_time_control(0, 100);
+    set_param(&mut freeze, "位置", Track::constant(50.0, 1));
+    let t = requested_time_under(&mut r, freeze.clone(), 0, 10);
+    assert!(near(t, 50.0 / 30.0), "静止: {t}");
+    // 逆再生（位置 100 → 0%）: 10 フレーム目は 90 フレーム目の絵
+    let mut reverse = TimelineObject::new_time_control(0, 100);
+    set_param(&mut reverse, "位置", linear(100.0, 0.0, 100));
+    let t = requested_time_under(&mut r, reverse, 0, 10);
+    assert!(near(t, 90.0 / 30.0), "逆再生: {t}");
+    // コマ落ち 4: 10 フレーム目は 8 フレーム目の絵
+    let mut drop = TimelineObject::new_time_control(0, 100);
+    set_param(&mut drop, "コマ落ち", Track::constant(4.0, 0));
+    let t = requested_time_under(&mut r, drop, 0, 10);
+    assert!(near(t, 8.0 / 30.0), "コマ落ち: {t}");
+    // 動画より下のレイヤーにある時間制御は効かない
+    let t = requested_time_under(&mut r, freeze, 2, 10);
+    assert!(near(t, 10.0 / 30.0), "下の時間制御は無関係: {t}");
+}
+
+#[test]
+fn time_control_shows_objects_that_exist_at_the_remapped_time() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(20, 20);
+    let mut ctrl = TimelineObject::new_time_control(0, 100);
+    set_param(&mut ctrl, "位置", Track::constant(55.0, 1)); // 55 フレーム目
+    s.insert_object(0, ctrl);
+    s.insert_object(1, shape(50, 60, 0, "ff0000"));
+    assert_near(px(&r.render(&s, 0, &mut NoMedia).unwrap(), 10, 10), [255, 0, 0, 255], 0, "置き換え後の時刻のオブジェクト");
+    s.layers[0].visible = false;
+    assert_near(px(&r.render(&s, 0, &mut NoMedia).unwrap(), 10, 10), [0, 0, 0, 255], 0, "時間制御が無ければ範囲外");
+}
+
+/// Root (100x100、青背景) と、40x20 の子シーン（中央に 10x10 の赤い四角、周りは透明）。
+fn project_with_child() -> au2_core::Project {
+    let mut root = scene(100, 100);
+    root.insert_object(0, shape(0, 9, 0, "0000ff"));
+    let mut child = Scene::new("Scene1", SceneSettings { width: 40, height: 20, length: 30, ..Default::default() });
+    let mut square = shape(0, 29, 2, "ff0000");
+    set_track(&mut square, "標準描画", "拡大率", 10.0);
+    child.insert_object(0, square);
+    let mut project = au2_core::Project::new("p", root);
+    project.scenes.push(child);
+    project
+}
+
+#[test]
+fn scene_object_draws_the_other_scene_at_its_position() {
+    let Some(mut r) = renderer() else { return };
+    let mut project = project_with_child();
+    let mut obj = TimelineObject::new_scene(0, 9, 1);
+    set_track(&mut obj, "標準描画", "X", 20.0);
+    set_track(&mut obj, "標準描画", "拡大率", 200.0); // 80x40、中の四角は 20x20
+    project.scenes[0].insert_object(1, obj);
+    let f = r.render_project(&project, 0, 0, &mut NoMedia).unwrap();
+    // 子シーンの中心は (70, 50)。赤い四角は x 60..80, y 40..60
+    assert_near(px(&f, 70, 50), [255, 0, 0, 255], 1, "子シーンの中身");
+    assert_near(px(&f, 62, 42), [255, 0, 0, 255], 1, "四角の内側（拡大率 200%）");
+    assert_near(px(&f, 40, 50), [0, 0, 255, 255], 1, "子シーンの透明な部分から親の背景が見える");
+    assert_near(px(&f, 57, 50), [0, 0, 255, 255], 1, "四角の左外");
+    assert_near(px(&f, 20, 20), [0, 0, 255, 255], 1, "子シーンの外");
+
+    // 子シーンの時刻: 四角を 10 フレーム目以降だけにすると、0 フレーム目には無く、再生位置 11 なら見える
+    project.scenes[1].layers[0].objects[0].frame_start = 10;
+    let f = r.render_project(&project, 0, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 70, 50), [0, 0, 255, 255], 1, "子シーンの 0 フレーム目には四角が無い");
+    let obj = &mut project.scenes[0].layers[1].objects[0];
+    set_param(obj, "再生位置", Track::constant(11.0, 0));
+    let f = r.render_project(&project, 0, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 70, 50), [255, 0, 0, 255], 1, "再生位置 11 = 子の 10 フレーム目");
+
+    // Project を渡さない render() ではシーンオブジェクトは描かれない
+    let f = r.render(&project.scenes[0], 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 70, 50), [0, 0, 255, 255], 1, "参照先が無い");
+    assert!(r.render_project(&project, 5, 0, &mut NoMedia).is_err(), "存在しないシーン");
+}
+
+#[test]
+fn recursive_scene_references_terminate() {
+    let Some(mut r) = renderer() else { return };
+    let mut project = project_with_child();
+    // Root → 自分自身、Scene1 → Scene2 → Scene1 の循環
+    project.scenes[0].insert_object(1, TimelineObject::new_scene(0, 9, 0));
+    project.scenes[1].insert_object(1, TimelineObject::new_scene(0, 29, 2));
+    let mut scene2 = Scene::new("Scene2", SceneSettings { width: 40, height: 20, length: 30, ..Default::default() });
+    scene2.insert_object(0, TimelineObject::new_scene(0, 29, 1));
+    project.scenes.push(scene2);
+    project.scenes[0].insert_object(2, TimelineObject::new_scene(0, 9, 1));
+    let f = r.render_project(&project, 0, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 50, 50), [255, 0, 0, 255], 1, "循環の外側は描かれる（Scene1 の四角）");
+    assert_near(px(&f, 5, 5), [0, 0, 255, 255], 1, "背景");
+}
+
+#[test]
+fn framebuffer_object_redraws_what_was_composited_so_far() {
+    let Some(mut r) = renderer() else { return };
+    let build = |clear: bool| {
+        let mut s = scene(100, 100);
+        s.insert_object(0, shape(0, 9, 0, "00ff00"));
+        let mut dot = shape(0, 9, 2, "ff0000"); // 10x10 の赤を (10, 10) を中心に
+        set_track(&mut dot, "標準描画", "X", -40.0);
+        set_track(&mut dot, "標準描画", "Y", -40.0);
+        set_track(&mut dot, "標準描画", "拡大率", 10.0);
+        s.insert_object(1, dot);
+        let mut fb = TimelineObject::new_framebuffer(0, 9);
+        set_param(&mut fb, "フレームバッファをクリア", Track::constant(if clear { 1.0 } else { 0.0 }, 0));
+        set_track(&mut fb, "標準描画", "拡大率", 50.0);
+        s.insert_object(2, fb);
+        s
+    };
+    // クリアなし: 元の絵の上に、半分に縮めた写しが重なる
+    let f = r.render(&build(false), 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 10, 10), [255, 0, 0, 255], 1, "元の赤は残る");
+    assert_near(px(&f, 30, 30), [255, 0, 0, 255], 1, "縮小した写しの赤（中心 + (-40, -40) × 0.5）");
+    assert_near(px(&f, 5, 50), [0, 255, 0, 255], 1, "写しの外は元の背景");
+    // クリアあり: 写しだけが残り、外は黒
+    let f = r.render(&build(true), 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 10, 10), [0, 0, 0, 255], 1, "元の絵は消える");
+    assert_near(px(&f, 30, 30), [255, 0, 0, 255], 1, "写しの赤");
+    assert_near(px(&f, 50, 50), [0, 255, 0, 255], 1, "写しの緑");
+    assert_near(px(&f, 5, 50), [0, 0, 0, 255], 1, "写しの外は黒");
+}
+
+#[test]
+fn previous_object_redraws_the_previous_image_at_its_own_position() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(100, 50);
+    let mut sq = shape(0, 9, 2, "ff00ff");
+    set_track(&mut sq, "標準描画", "X", -25.0);
+    set_track(&mut sq, "標準描画", "拡大率", 40.0); // 40x40
+    s.insert_object(0, sq);
+    let mut prev = TimelineObject::new_previous_object(0, 9);
+    set_track(&mut prev, "標準描画", "X", 25.0);
+    set_track(&mut prev, "標準描画", "拡大率", 20.0); // 20x20
+    s.insert_object(1, prev);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    assert_near(px(&f, 25, 25), [255, 0, 255, 255], 1, "元のオブジェクト");
+    assert_near(px(&f, 75, 25), [255, 0, 255, 255], 1, "直前オブジェクトの位置に同じ絵");
+    assert_near(px(&f, 75 + 12, 25), [0, 0, 0, 255], 1, "直前オブジェクト自身の拡大率（20x20）");
+    assert_near(px(&f, 25 + 15, 25), [255, 0, 255, 255], 1, "元は 40x40 のまま");
+}
