@@ -499,6 +499,7 @@ dependencies = [
  "au2-exo",
  "au2-media",
  "au2-plugin",
+ "au2-render",
  "eframe",
  "egui_dock",
  "env_logger",

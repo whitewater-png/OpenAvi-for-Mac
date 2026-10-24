@@ -25,7 +25,7 @@ pub use au2_media::RgbaFrame;
 pub use eval::{eval_draw_params, DrawParams};
 pub use gpu::Gpu;
 pub use media::{MediaSource, NoMedia};
-pub use renderer::{Renderer, FORMAT};
+pub use renderer::{ObjectBounds, Renderer, FORMAT};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {

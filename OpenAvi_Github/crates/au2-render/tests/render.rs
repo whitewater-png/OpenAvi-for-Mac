@@ -329,3 +329,25 @@ fn text_is_drawn_when_a_font_is_available() {
     s.insert_object(0, TimelineObject::new_text(0, 9, ""));
     assert!(r.render(&s, 0, &mut NoMedia).unwrap().pixels.chunks(4).all(|p| p == [0, 0, 0, 255]));
 }
+
+#[test]
+fn object_bounds_follow_position_zoom_and_rotation() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(200, 100);
+    let mut obj = shape(0, 9, 2, "ffffff");
+    set_track(&mut obj, "標準描画", "X", 30.0);
+    set_track(&mut obj, "標準描画", "Y", -10.0);
+    set_track(&mut obj, "標準描画", "拡大率", 50.0);
+    set_track(&mut obj, "標準描画", "回転", 90.0);
+    let id = obj.id;
+    s.insert_object(0, obj);
+    r.render_to_framebuffer(&s, 0, &mut NoMedia).unwrap();
+    let b = r.object_bounds(id).expect("描いたオブジェクトの範囲");
+    assert_eq!(b.center, [30.0, -10.0]);
+    assert_eq!(b.half, [25.0, 25.0]);
+    assert!((b.angle - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    assert!(r.framebuffer_view().is_some());
+    // 範囲外のフレームでは記録されない
+    r.render_to_framebuffer(&s, 50, &mut NoMedia).unwrap();
+    assert!(r.object_bounds(id).is_none());
+}

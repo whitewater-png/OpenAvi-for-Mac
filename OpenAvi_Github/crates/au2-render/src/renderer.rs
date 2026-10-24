@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use au2_core::{EffectKind, Frame, ObjectCategory, Scene, TimelineObject};
+use au2_core::{EffectKind, Frame, ObjectCategory, ObjectId, Scene, TimelineObject};
 use au2_media::RgbaFrame;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -56,6 +56,16 @@ struct ColorCorrectionUniform {
     b: [f32; 4],
 }
 
+/// 直近の描画での、オブジェクトの描画範囲（回転した矩形）。選択枠などの UI 用。
+/// 座標はシーン中心基準のピクセル（+y 下）、`half` は回転前の半サイズ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectBounds {
+    pub center: [f32; 2],
+    pub half: [f32; 2],
+    /// ラジアン（正 = 時計回り）
+    pub angle: f32,
+}
+
 struct TexEntry {
     size: (u32, u32),
     _texture: wgpu::Texture,
@@ -72,6 +82,9 @@ struct Targets {
     height: u32,
     main: wgpu::Texture,
     main_view: wgpu::TextureView,
+    /// 画面表示用（sRGB として解釈するビュー）。egui はテクスチャを sRGB として扱うため、
+    /// ガンマ空間の値をそのまま渡すと二重にガンマ補正されて白っぽくなる。
+    display_view: wgpu::TextureView,
     /// フィルタパスが読む用のコピー先（ping-pong 相手）
     scratch: wgpu::Texture,
     scratch_bind_group: wgpu::BindGroup,
@@ -90,6 +103,8 @@ pub struct Renderer {
     filter_uniform_layout: wgpu::BindGroupLayout,
     filter_src_layout: wgpu::BindGroupLayout,
     font: Option<ab_glyph::FontVec>,
+    bounds: HashMap<ObjectId, ObjectBounds>,
+    generation: u64,
     targets: Option<Targets>,
     textures: HashMap<(String, u32), Arc<TexEntry>>,
 }
@@ -268,6 +283,8 @@ impl Renderer {
             filter_uniform_layout,
             filter_src_layout,
             font: None,
+            bounds: HashMap::new(),
+            generation: 0,
             targets: None,
             textures: HashMap::new(),
         }
@@ -289,6 +306,21 @@ impl Renderer {
 
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
+    }
+
+    /// 直近の描画結果を egui などに表示するためのビュー（sRGB 解釈）。まだ描いていなければ `None`。
+    pub fn framebuffer_view(&self) -> Option<&wgpu::TextureView> {
+        self.targets.as_ref().map(|t| &t.display_view)
+    }
+
+    /// フレームバッファを作り直すたびに増える番号。表示側がテクスチャを再登録する目安。
+    pub fn framebuffer_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 直近の描画でのオブジェクトの描画範囲。描かれなかったオブジェクトは `None`。
+    pub fn object_bounds(&self, id: ObjectId) -> Option<ObjectBounds> {
+        self.bounds.get(&id).copied()
     }
 
     fn make_texture_entry(
@@ -332,7 +364,8 @@ impl Renderer {
         }
         let device = &self.gpu.device;
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        let make = |label: &str, usage: wgpu::TextureUsages| {
+        let srgb = [FORMAT.add_srgb_suffix()];
+        let make = |label: &str, usage: wgpu::TextureUsages, view_formats: &[wgpu::TextureFormat]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size,
@@ -341,7 +374,7 @@ impl Renderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: FORMAT,
                 usage,
-                view_formats: &[],
+                view_formats,
             })
         };
         let main = make(
@@ -350,9 +383,15 @@ impl Renderer {
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::TEXTURE_BINDING,
+            &srgb,
         );
-        let scratch = make("framebuffer scratch", wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING);
+        let scratch =
+            make("framebuffer scratch", wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING, &[]);
         let main_view = main.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_view = main.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(FORMAT.add_srgb_suffix()),
+            ..Default::default()
+        });
         let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor::default());
         let scratch_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scratch bind group"),
@@ -366,7 +405,8 @@ impl Renderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        self.targets = Some(Targets { width, height, main, main_view, scratch, scratch_bind_group, readback, padded_row });
+        self.generation += 1;
+        self.targets = Some(Targets { width, height, main, main_view, display_view, scratch, scratch_bind_group, readback, padded_row });
     }
 
     /// メディアフレームを GPU テクスチャにしてキャッシュします。
@@ -392,13 +432,14 @@ impl Renderer {
         Some(entry)
     }
 
-    /// `frame` 番目のフレームを描画して RGBA で返します（読み戻しまで同期）。
-    pub fn render(
+    /// `frame` 番目のフレームを描画し、結果を [`Renderer::framebuffer_view`] のテクスチャに残します（読み戻しなし）。
+    /// プレビューのように、画面へ直接表示する用途向けです。
+    pub fn render_to_framebuffer(
         &mut self,
         scene: &Scene,
         frame: Frame,
         media: &mut dyn MediaSource,
-    ) -> Result<RgbaFrame, RenderError> {
+    ) -> Result<(), RenderError> {
         let width = scene.settings.width.max(1);
         let height = scene.settings.height.max(1);
         self.ensure_targets(width, height);
@@ -413,6 +454,7 @@ impl Renderer {
         let mut ops: Vec<Op> = Vec::new();
         let canvas = [width as f32, height as f32];
         let fps = scene.settings.frame_rate.as_f64();
+        self.bounds.clear();
 
         for (li, obj) in scene.objects_at(frame) {
             if !scene.layers[li].visible {
@@ -427,6 +469,10 @@ impl Renderer {
                         continue;
                     }
                     if let Some((uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
+                        self.bounds.insert(
+                            obj.id,
+                            ObjectBounds { center: uniform.center, half: uniform.half, angle: uniform.angle },
+                        );
                         let offset = sprite_bytes.len() as u32;
                         sprite_bytes.extend_from_slice(bytemuck::bytes_of(&uniform));
                         sprite_bytes.resize((offset + sprite_stride) as usize, 0);
@@ -559,6 +605,22 @@ impl Renderer {
             }
         }
 
+        self.gpu.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
+    /// `frame` 番目のフレームを描画して RGBA で返します（読み戻しまで同期）。書き出し・テスト用。
+    pub fn render(
+        &mut self,
+        scene: &Scene,
+        frame: Frame,
+        media: &mut dyn MediaSource,
+    ) -> Result<RgbaFrame, RenderError> {
+        self.render_to_framebuffer(scene, frame, media)?;
+        let device = &self.gpu.device;
+        let targets = self.targets.as_ref().expect("render_to_framebuffer で確保済み");
+        let (width, height) = (targets.width, targets.height);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &targets.main,

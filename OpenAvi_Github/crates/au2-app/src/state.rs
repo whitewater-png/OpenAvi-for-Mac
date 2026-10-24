@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use au2_core::{Frame, ObjectId, Scene, SceneSettings, TimelineObject};
 use au2_exo::TextEncoding;
-use au2_media::{MediaCache, MediaKind};
+use au2_media::{MediaCache, MediaKind, RgbaFrame};
+use au2_render::{MediaSource, Renderer};
 use au2_plugin::PluginRegistry;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
@@ -66,6 +67,54 @@ impl Default for TimelineView {
     }
 }
 
+/// プレビュー用の GPU 描画。eframe の wgpu デバイスを共有し、描画結果を読み戻さずに画面へ出す。
+pub struct PreviewRenderer {
+    pub renderer: Renderer,
+    render_state: eframe::egui_wgpu::RenderState,
+    /// egui に登録済みのフレームバッファ（テクスチャ ID と、登録時の世代番号）
+    texture: Option<(egui::TextureId, u64)>,
+}
+
+impl PreviewRenderer {
+    pub fn new(render_state: eframe::egui_wgpu::RenderState) -> Self {
+        let gpu = au2_render::Gpu::from_parts(
+            render_state.device.clone(),
+            render_state.queue.clone(),
+            render_state.adapter.get_info(),
+        );
+        let mut renderer = Renderer::new(gpu);
+        match renderer.load_system_font() {
+            Some(path) => log::info!("プレビュー用フォント: {path}"),
+            None => log::warn!("プレビュー用の日本語フォントが見つかりません（テキストは描画されません）"),
+        }
+        Self { renderer, render_state, texture: None }
+    }
+}
+
+/// 相対パス・サンプル名を解決してから `MediaCache` に渡す供給元。
+struct ResolvingMedia<'a>(&'a mut MediaCache);
+
+impl MediaSource for ResolvingMedia<'_> {
+    fn frame(&mut self, path: &str, media_frame: u32, time_sec: f64) -> Option<&RgbaFrame> {
+        let resolved = resolve_media_path(path);
+        MediaSource::frame(self.0, &resolved.to_string_lossy(), media_frame, time_sec)
+    }
+}
+
+fn resolve_media_path(path_str: &str) -> PathBuf {
+    let mut path = PathBuf::from(path_str);
+    if !path.exists() {
+        if let Some(resolved) = resolve_app_path(path_str) {
+            path = resolved;
+        } else if path_str.ends_with("sample.mp4") {
+            if let Some(sample_vid) = resolve_app_path("samples/sample_video.mp4") {
+                path = sample_vid;
+            }
+        }
+    }
+    path
+}
+
 pub struct EditorState {
     pub scene: Scene,
     /// 現在のプロジェクトファイルパス（`.aup` または `.exo`）
@@ -88,6 +137,8 @@ pub struct EditorState {
     /// デコード済み RGBA フレームの GPU テクスチャキャッシュ
     textures: HashMap<(PathBuf, u32), (TextureHandle, [usize; 2])>,
     pub dirty: bool,
+    /// GPU プレビュー描画（起動時に eframe から wgpu を受け取れた場合のみ）
+    pub preview: Option<PreviewRenderer>,
 }
 
 fn resolve_app_path(rel: &str) -> Option<PathBuf> {
@@ -218,11 +269,35 @@ impl Default for EditorState {
             selected_source: None,
             textures: HashMap::new(),
             dirty: false,
+            preview: None,
         }
     }
 }
 
 impl EditorState {
+    /// 現在フレームをプレビュー用に描画し、egui で表示できるテクスチャを返します。
+    pub fn render_preview(&mut self) -> Option<egui::TextureId> {
+        let pv = self.preview.as_mut()?;
+        if let Err(e) = pv.renderer.render_to_framebuffer(&self.scene, self.frame, &mut ResolvingMedia(&mut self.media)) {
+            log::warn!("プレビュー描画に失敗しました: {e}");
+            return None;
+        }
+        let generation = pv.renderer.framebuffer_generation();
+        let view = pv.renderer.framebuffer_view()?;
+        let mut egui_renderer = pv.render_state.renderer.write();
+        let device = &pv.render_state.device;
+        let id = match pv.texture {
+            Some((id, g)) if g == generation => id,
+            Some((id, _)) => {
+                egui_renderer.update_egui_texture_from_wgpu_texture(device, view, eframe::wgpu::FilterMode::Linear, id);
+                id
+            }
+            None => egui_renderer.register_native_texture(device, view, eframe::wgpu::FilterMode::Linear),
+        };
+        pv.texture = Some((id, generation));
+        Some(id)
+    }
+
     /// 編集可能な最終フレーム。
     pub fn last_frame(&self) -> Frame {
         self.scene.settings.length.max(self.scene.content_end()).max(1) - 1
@@ -318,16 +393,7 @@ impl EditorState {
         frame_index: u32,
         time_sec: f64,
     ) -> Option<(egui::TextureId, [usize; 2])> {
-        let mut path = PathBuf::from(path_str);
-        if !path.exists() {
-            if let Some(resolved) = resolve_app_path(path_str) {
-                path = resolved;
-            } else if path_str.ends_with("sample.mp4") {
-                if let Some(sample_vid) = resolve_app_path("samples/sample_video.mp4") {
-                    path = sample_vid;
-                }
-            }
-        }
+        let path = resolve_media_path(path_str);
         // 静止画の場合は frame_index = 0 で共通化
         let key_frame = match MediaKind::from_path(&path) {
             Some(MediaKind::Image) => 0,

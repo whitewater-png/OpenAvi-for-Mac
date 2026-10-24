@@ -76,6 +76,7 @@ impl OpenAviApp {
         log::info!("GPU: {gpu_info}");
 
         let mut st = EditorState::default();
+        st.preview = cc.wgpu_render_state.clone().map(crate::state::PreviewRenderer::new);
         match initial {
             Some(path) => st.load_path(&path),
             None => st.load_exo(SAMPLE_EXO, None),
