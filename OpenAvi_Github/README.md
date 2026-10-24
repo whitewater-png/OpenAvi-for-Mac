@@ -98,6 +98,8 @@ powershell -ExecutionPolicy Bypass -File .\package-release.ps1
 
 macOS で Rust が未導入の場合は、[rustup](https://rustup.rs/) でインストールしてください。
 
+Linux でビルドする場合は、音声出力（cpal）のために `libasound2-dev` と `pkg-config` が必要です（`sudo apt install libasound2-dev pkg-config`）。動画の読み込み・書き出し・音声のデコードには、どの OS でも FFmpeg が必要です。
+
 ---
 
 ## ライセンス

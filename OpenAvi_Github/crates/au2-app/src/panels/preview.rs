@@ -37,7 +37,7 @@ pub fn ui(ui: &mut egui::Ui, st: &mut EditorState) {
             painter.text(
                 canvas.center(),
                 Align2::CENTER_CENTER,
-                "GPU プレビューを初期化できませんでした",
+                st.preview.as_ref().and_then(|p| p.last_error.clone()).unwrap_or_else(|| "GPU プレビューを初期化できませんでした".into()),
                 FontId::proportional(14.0),
                 Color32::LIGHT_GRAY,
             );

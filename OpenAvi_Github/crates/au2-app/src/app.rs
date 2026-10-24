@@ -182,6 +182,10 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for OpenAviApp {
+    fn on_exit(&mut self) {
+        self.st.shutdown();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ドラッグ＆ドロップで .aup / .exo / メディア / プラグインを一括処理
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
@@ -189,11 +193,15 @@ impl eframe::App for OpenAviApp {
             self.st.load_path(&path);
         }
 
+        self.st.child_pointer_down = false;
         handle_shortcuts(ctx, &mut self.st);
         self.st.tick();
         self.st.poll_export();
-        if self.st.playing || self.st.export_running() {
+        if self.st.playing {
             ctx.request_repaint();
+        } else if self.st.export_running() {
+            // 進捗表示のためだけなので、毎フレーム再描画しない
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         self.menu_bar(ctx);
@@ -218,7 +226,7 @@ impl eframe::App for OpenAviApp {
         self.plugins_window(ctx);
 
         // パネルでの編集が済んだ後に、シーンの変化を履歴へ記録する（ドラッグ中は確定を保留）
-        let stable = !ctx.input(|i| i.pointer.any_down());
+        let stable = !(ctx.input(|i| i.pointer.any_down()) || self.st.child_pointer_down);
         self.st.observe_history(stable);
 
         if self.show_about {
@@ -476,6 +484,8 @@ impl OpenAviApp {
                         egui::Window::new(tab.title()).default_size(size).show(ctx, |ui| panel_ui(tab, ui, st));
                     } else {
                         handle_shortcuts(ctx, st);
+                        // egui の入力はウィンドウ（viewport）ごと。子ウィンドウでのドラッグ中も Undo を保留する
+                        st.child_pointer_down |= ctx.input(|i| i.pointer.any_down());
                         egui::CentralPanel::default().show(ctx, |ui| panel_ui(tab, ui, st));
                         if ctx.input(|i| i.viewport().close_requested()) {
                             closed = true;

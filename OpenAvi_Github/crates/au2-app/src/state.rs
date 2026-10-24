@@ -77,6 +77,8 @@ pub struct PreviewRenderer {
     render_state: eframe::egui_wgpu::RenderState,
     /// egui に登録済みのフレームバッファ（テクスチャ ID と、登録時の世代番号）
     texture: Option<(egui::TextureId, u64)>,
+    /// 直近の描画エラー（画面に出す。同じエラーを毎フレームログに出さないためにも使う）
+    pub last_error: Option<String>,
 }
 
 impl PreviewRenderer {
@@ -84,14 +86,14 @@ impl PreviewRenderer {
         let gpu = au2_render::Gpu::from_parts(
             render_state.device.clone(),
             render_state.queue.clone(),
-            render_state.adapter.get_info(),
+            &render_state.adapter,
         );
         let mut renderer = Renderer::new(gpu);
         match renderer.load_system_font() {
             Some(path) => log::info!("プレビュー用フォント: {path}"),
             None => log::warn!("プレビュー用の日本語フォントが見つかりません（テキストは描画されません）"),
         }
-        Self { renderer, render_state, texture: None }
+        Self { renderer, render_state, texture: None, last_error: None }
     }
 }
 
@@ -102,6 +104,21 @@ impl MediaSource for ResolvingMedia<'_> {
     fn frame(&mut self, path: &str, media_frame: u32, time_sec: f64) -> Option<&RgbaFrame> {
         let resolved = resolve_media_path(path);
         MediaSource::frame(self.0, &resolved.to_string_lossy(), media_frame, time_sec)
+    }
+
+    fn native_size(&mut self, path: &str) -> Option<(u32, u32)> {
+        let resolved = resolve_media_path(path);
+        MediaSource::native_size(self.0, &resolved.to_string_lossy())
+    }
+
+    fn prepare(&mut self, path: &str) {
+        let resolved = resolve_media_path(path);
+        MediaSource::prepare(self.0, &resolved.to_string_lossy());
+    }
+
+    fn duration_secs(&mut self, path: &str) -> Option<f64> {
+        let resolved = resolve_media_path(path);
+        MediaSource::duration_secs(self.0, &resolved.to_string_lossy())
     }
 }
 
@@ -123,10 +140,29 @@ fn resolve_media_path(path_str: &str) -> PathBuf {
 pub struct AudioState {
     player: au2_audio::AudioPlayer,
     cache: au2_audio::AudioCache,
+    /// 現在のバッファが終わるフレーム（含まない）。近づいたら続きをミックスし直す
+    window_end: Frame,
+    /// シーク直後などの鳴らし直しを少し待つ（ドラッグ中に毎フレームミックスし直さないため）
+    restart_at: Option<Instant>,
 }
 
-/// ライブ再生用にミックスする最大の長さ（秒）。再生開始時に先頭からまとめて作る。
-const MAX_LIVE_AUDIO_SECS: f64 = 600.0;
+impl AudioState {
+    fn new() -> Self {
+        Self {
+            player: au2_audio::AudioPlayer::new(),
+            cache: au2_audio::AudioCache::new(),
+            window_end: 0,
+            restart_at: None,
+        }
+    }
+}
+
+/// 1 回にミックスする長さ（秒）。長いほどミックス 1 回が重く、短いほど継ぎ目（鳴らし直し）が増える。
+const AUDIO_WINDOW_SECS: f64 = 30.0;
+/// 窓の終わりまで残りこの秒数になったら、続きをミックスし直す。
+const AUDIO_REFILL_MARGIN_SECS: f64 = 2.0;
+/// シーク操作が止まってから鳴らし直すまでの待ち時間。
+const AUDIO_RESTART_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// バックグラウンドで動いている動画書き出し。
 pub struct ExportJob {
@@ -165,6 +201,8 @@ pub struct EditorState {
     /// Undo / Redo（`scene` のスナップショット履歴）
     pub history: History<Scene>,
     pub export: Option<ExportJob>,
+    /// 子ウィンドウ（マルチウィンドウ表示）でマウスが押されているか。Undo の確定を保留するのに使う
+    pub child_pointer_down: bool,
 }
 
 fn resolve_app_path(rel: &str) -> Option<PathBuf> {
@@ -298,8 +336,9 @@ impl Default for EditorState {
             textures: HashMap::new(),
             dirty: false,
             preview: None,
-            audio: AudioState { player: au2_audio::AudioPlayer::new(), cache: au2_audio::AudioCache::new() },
+            audio: AudioState::new(),
             export: None,
+            child_pointer_down: false,
         }
     }
 }
@@ -309,9 +348,14 @@ impl EditorState {
     pub fn render_preview(&mut self) -> Option<egui::TextureId> {
         let pv = self.preview.as_mut()?;
         if let Err(e) = pv.renderer.render_to_framebuffer(&self.scene, self.frame, &mut ResolvingMedia(&mut self.media)) {
-            log::warn!("プレビュー描画に失敗しました: {e}");
+            let message = e.to_string();
+            if pv.last_error.as_deref() != Some(&message) {
+                log::warn!("プレビュー描画に失敗しました: {message}");
+            }
+            pv.last_error = Some(message);
             return None;
         }
+        pv.last_error = None;
         let generation = pv.renderer.framebuffer_generation();
         let view = pv.renderer.framebuffer_view()?;
         let mut egui_renderer = pv.render_state.renderer.write();
@@ -337,7 +381,7 @@ impl EditorState {
         self.frame = frame.min(self.last_frame());
         if self.playing {
             self.play_origin = Some((Instant::now(), self.frame));
-            self.restart_audio();
+            self.request_audio_restart();
         }
     }
 
@@ -349,24 +393,61 @@ impl EditorState {
     pub fn toggle_play(&mut self) {
         self.playing = !self.playing;
         self.play_origin = self.playing.then(|| (Instant::now(), self.frame));
-        self.restart_audio();
+        self.start_audio_now();
     }
 
-    /// 現在フレームから音声を鳴らし直します（停止中なら止めるだけ）。
-    fn restart_audio(&mut self) {
+    /// 現在フレームから音声を今すぐ鳴らし直します（停止中なら止めるだけ）。
+    fn start_audio_now(&mut self) {
         self.audio.player.stop();
+        self.audio.restart_at = None;
         if !self.playing {
             return;
         }
         let fps = self.scene.settings.frame_rate.as_f64();
         let from = self.frame;
-        let end = (self.last_frame() + 1).min(from + (MAX_LIVE_AUDIO_SECS * fps) as Frame);
+        let end = (self.last_frame() + 1).min(from.saturating_add((AUDIO_WINDOW_SECS * fps) as Frame));
+        self.audio.window_end = end;
         let mixed = au2_audio::mix(&self.scene, &mut self.audio.cache, from, end, &resolve_media_path);
         if mixed.iter().all(|&v| v == 0.0) {
             return;
         }
-        if let Err(e) = self.audio.player.play(Arc::new(mixed)) {
-            log::warn!("音声を再生できません: {e}");
+        match self.audio.player.play(Arc::new(mixed)) {
+            // デコードとミックスに時間がかかった分だけ映像が先に進んでいるので、音が鳴り始めた時刻に合わせ直す
+            Ok(()) => self.play_origin = Some((Instant::now(), from)),
+            Err(e) => log::warn!("音声を再生できません: {e}"),
+        }
+    }
+
+    /// シークや編集で音の位置が変わった。古い音は止め、操作が落ち着いてから鳴らし直す。
+    fn request_audio_restart(&mut self) {
+        self.audio.player.stop();
+        self.audio.restart_at = Some(Instant::now());
+    }
+
+    /// 再生中の音声の保守（毎フレーム）: 予約された鳴らし直しと、窓が尽きる前の続きのミックス。
+    fn service_audio(&mut self) {
+        if !self.playing {
+            return;
+        }
+        if let Some(t) = self.audio.restart_at {
+            if t.elapsed() >= AUDIO_RESTART_DEBOUNCE {
+                self.start_audio_now();
+            }
+            return;
+        }
+        let fps = self.scene.settings.frame_rate.as_f64();
+        let margin = (AUDIO_REFILL_MARGIN_SECS * fps) as Frame;
+        if self.audio.window_end <= self.last_frame() && self.frame.saturating_add(margin) >= self.audio.window_end {
+            self.start_audio_now();
+        }
+    }
+
+    /// アプリ終了時の後始末: 音を止め、書き出し中なら止めて終わるのを待つ（一時ファイルを残さない）。
+    pub fn shutdown(&mut self) {
+        self.audio.player.stop();
+        if let Some(job) = self.export.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            let _ = job.handle.join();
         }
     }
 
@@ -403,7 +484,7 @@ impl EditorState {
         }
         self.frame = self.frame.min(self.last_frame());
         if self.playing {
-            self.restart_audio();
+            self.request_audio_restart();
         }
     }
 
@@ -419,8 +500,9 @@ impl EditorState {
         }
         self.frame = f;
         if wrapped {
-            self.restart_audio();
+            self.start_audio_now();
         }
+        self.service_audio();
     }
 
     pub fn export_running(&self) -> bool {
@@ -452,6 +534,8 @@ impl EditorState {
             let mut renderer = Renderer::new(au2_render::Gpu::headless()?);
             renderer.load_system_font();
             let mut cache = MediaCache::new();
+            cache.set_max_decode_width(u32::MAX); // 書き出しは動画を原寸でデコードする
+            cache.set_retry_backoff(false); // 失敗後の待ち時間を置くと、その間のフレームがプレースホルダで書き出されてしまう
             let mut progress = |n: u32, all: u32| {
                 d.store(n, Ordering::Relaxed);
                 t.store(all, Ordering::Relaxed);
@@ -488,6 +572,11 @@ impl EditorState {
         self.status = match job.handle.join() {
             Ok(Ok(())) => format!("書き出しが完了しました: {}", job.output.display()),
             Ok(Err(au2_export::ExportError::Cancelled)) => "書き出しをキャンセルしました".into(),
+            // 書き出し自体は成功している。完成したファイルの場所を伝える（「失敗」とは表示しない）
+            Ok(Err(e @ au2_export::ExportError::Finalize { .. })) => {
+                log::warn!("{e}");
+                e.to_string()
+            }
             Ok(Err(e)) => {
                 log::error!("書き出しに失敗: {e}");
                 format!("書き出しに失敗しました: {e}")
@@ -507,6 +596,7 @@ impl EditorState {
             audio: AudioState {
                 player: std::mem::take(&mut self.audio.player),
                 cache: std::mem::take(&mut self.audio.cache),
+                ..AudioState::new()
             },
             export: self.export.take(),
             ..Self::default()
@@ -576,6 +666,10 @@ impl EditorState {
         }
 
         let rgba = self.media.get_frame(&path, key_frame, time_sec)?;
+        // サムネイルは GPU の最大テクスチャサイズ（egui 既定 8192）を超えると落ちるので、縮小してから渡す
+        let limit = ctx.input(|i| i.max_texture_side).min(2048) as u32;
+        let fitted = rgba.fit_within(limit);
+        let rgba = fitted.as_ref().unwrap_or(rgba);
         let size = [rgba.width as usize, rgba.height as usize];
         let color_img = ColorImage::from_rgba_unmultiplied(size, &rgba.pixels);
 
@@ -968,5 +1062,68 @@ mod tests {
         st.observe_history(true);
         st.new_scene();
         assert!(!st.history.can_undo());
+    }
+
+    #[test]
+    fn audio_window_is_refilled_before_it_runs_out() {
+        let mut st = EditorState::default();
+        st.scene.settings.length = 3000; // 100 秒 @30fps
+        st.toggle_play();
+        assert_eq!(st.audio.window_end, 900, "最初の窓は 30 秒");
+
+        st.frame = 800;
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 900, "まだ余裕がある");
+        st.frame = 850; // 残り 50 フレーム（2 秒 = 60 フレーム未満）
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 850 + 900, "続きをミックスし直した");
+
+        st.frame = 2999; // 最後の窓は終端までなので、それ以上は鳴らし直さない
+        st.set_frame(2400);
+        st.audio.restart_at = Instant::now().checked_sub(AUDIO_RESTART_DEBOUNCE * 2);
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 3000);
+        st.frame = 2999;
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 3000);
+    }
+
+    #[test]
+    fn seeking_while_playing_is_debounced() {
+        let mut st = EditorState::default();
+        st.scene.settings.length = 3000;
+        st.toggle_play();
+        st.set_frame(1000);
+        assert!(st.audio.restart_at.is_some(), "シークは予約される");
+        // 実時間に頼らず、「予約されたばかり」と「待ち時間を過ぎた」状態を直接作って確かめる（負荷の高い環境でも安定）
+        st.audio.restart_at = Some(Instant::now() + std::time::Duration::from_secs(3600));
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 900, "待ち時間の間は鳴らし直さない");
+        st.audio.restart_at = Instant::now().checked_sub(AUDIO_RESTART_DEBOUNCE * 2);
+        st.service_audio();
+        assert_eq!(st.audio.window_end, 1900);
+        assert!(st.audio.restart_at.is_none());
+    }
+
+    /// プレビュー・書き出しが使う `ResolvingMedia` は、`MediaSource` の省略可能なメソッド（本来のサイズ・長さ）も
+    /// 必ず転送すること。転送し忘れるとトレイトの既定値（`None`）が返り、縮小デコード時のサイズ崩れや
+    /// ループ再生の無効化が静かに起きる。
+    #[test]
+    fn resolving_media_forwards_every_optional_source_method() {
+        let mut cache = MediaCache::new();
+        if !cache.has_ffmpeg() || !cache.has_ffprobe() {
+            return;
+        }
+        cache.set_max_decode_width(160); // デコードを縮小させ、本来のサイズとの違いが出るようにする
+        let mut media = ResolvingMedia(&mut cache);
+        // 相対パス（サンプル名）は resolve_media_path が実ファイルに解決する
+        let path = "samples/sample_video.mp4";
+        media.prepare(path);
+        assert!(media.duration_secs(path).is_some(), "prepare が転送され、フレームを要求しなくても長さが分かる");
+        let frame = media.frame(path, 0, 0.0).expect("サンプル動画をデコードできる");
+        assert_eq!((frame.width, frame.height), (160, 90));
+        assert_eq!(media.native_size(path), Some((320, 180)), "本来のサイズが転送される");
+        let duration = media.duration_secs(path).expect("長さが転送される");
+        assert!((duration - 2.0).abs() < 0.1, "長さ {duration}");
     }
 }
