@@ -551,6 +551,7 @@ dependencies = [
 name = "au2-render"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "au2-core",
  "au2-exo",
  "au2-media",

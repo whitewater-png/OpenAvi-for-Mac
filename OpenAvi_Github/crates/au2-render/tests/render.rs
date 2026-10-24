@@ -299,3 +299,33 @@ fn golden_sample_exo() {
     let f = r.render(&doc.scene, 30, &mut NoMedia).unwrap();
     assert_golden("sample_exo_f30", &f);
 }
+
+#[test]
+fn text_is_drawn_when_a_font_is_available() {
+    let Some(mut r) = renderer() else { return };
+    if r.load_system_font().is_none() {
+        eprintln!("日本語フォントが無いためスキップします");
+        return;
+    }
+    let mut s = scene(200, 100);
+    let mut text = TimelineObject::new_text(0, 9, "あA");
+    set_track(&mut text, "テキスト", "サイズ", 60.0);
+    s.insert_object(0, text);
+    let f = r.render(&s, 0, &mut NoMedia).unwrap();
+    // 文字は白。中央付近に白っぽい画素があり、隅は黒のまま
+    let lit = f.pixels.chunks(4).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count();
+    assert!(lit > 100, "白い画素が少なすぎる: {lit}");
+    assert_near(px(&f, 2, 2), [0, 0, 0, 255], 0, "隅");
+    assert_near(px(&f, 197, 97), [0, 0, 0, 255], 0, "隅");
+    // 文字は中央に寄っている: 左右の端 20px には何も描かれない
+    for y in 0..100 {
+        for x in (0..20).chain(180..200) {
+            assert_eq!(px(&f, x, y)[0], 0, "端に描画がある ({x},{y})");
+        }
+    }
+
+    // 空文字は何も描かない
+    let mut s = scene(50, 50);
+    s.insert_object(0, TimelineObject::new_text(0, 9, ""));
+    assert!(r.render(&s, 0, &mut NoMedia).unwrap().pixels.chunks(4).all(|p| p == [0, 0, 0, 255]));
+}

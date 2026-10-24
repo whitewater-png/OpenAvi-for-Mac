@@ -35,6 +35,7 @@ egui_dock = "0.14"
 rfd = "0.15"
 wgpu = "22"
 pollster = "0.3"
+ab_glyph = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 
 [profile.dev]

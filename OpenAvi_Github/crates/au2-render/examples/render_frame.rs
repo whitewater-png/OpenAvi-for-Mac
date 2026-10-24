@@ -24,6 +24,10 @@ fn main() {
     }
 
     let mut renderer = Renderer::new(Gpu::headless().expect("GPU を初期化できません"));
+    match renderer.load_system_font() {
+        Some(path) => eprintln!("フォント: {path}"),
+        None => eprintln!("日本語フォントが見つからないため、テキストは描画されません"),
+    }
     eprintln!("GPU: {}", renderer.gpu().adapter_info.name);
     let mut media = MediaCache::new();
     let started = std::time::Instant::now();

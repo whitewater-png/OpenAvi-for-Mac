@@ -20,6 +20,9 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// テクスチャキャッシュの上限枚数（超えたら全消去する簡易方式）。
 const TEXTURE_CACHE_LIMIT: usize = 64;
 
+/// テキストのテクスチャキャッシュキーの接頭辞（フォント変更時に無効化するため）。
+const TEXT_KEY_PREFIX: &str = "\0text\0";
+
 const SHAPE_CIRCLE: u32 = 0;
 const SHAPE_BOX: u32 = 1;
 const SHAPE_POLYGON: u32 = 2;
@@ -54,6 +57,7 @@ struct ColorCorrectionUniform {
 }
 
 struct TexEntry {
+    size: (u32, u32),
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
@@ -85,6 +89,7 @@ pub struct Renderer {
     filter_pipeline: wgpu::RenderPipeline,
     filter_uniform_layout: wgpu::BindGroupLayout,
     filter_src_layout: wgpu::BindGroupLayout,
+    font: Option<ab_glyph::FontVec>,
     targets: Option<Targets>,
     textures: HashMap<(String, u32), Arc<TexEntry>>,
 }
@@ -262,9 +267,24 @@ impl Renderer {
             filter_pipeline,
             filter_uniform_layout,
             filter_src_layout,
+            font: None,
             targets: None,
             textures: HashMap::new(),
         }
+    }
+
+    /// テキスト描画に使うフォント（`.ttf` / `.otf` / `.ttc`）を設定します。
+    pub fn set_font(&mut self, bytes: Vec<u8>, index: u32) -> bool {
+        self.textures.retain(|(k, _), _| !k.starts_with(TEXT_KEY_PREFIX));
+        self.font = crate::text::load_font(bytes, index);
+        self.font.is_some()
+    }
+
+    /// OS に入っている日本語フォントを探して設定し、見つかったパスを返します。
+    pub fn load_system_font(&mut self) -> Option<&'static str> {
+        crate::text::SYSTEM_FONT_CANDIDATES.iter().copied().find(|path| {
+            std::fs::read(path).is_ok_and(|bytes| self.set_font(bytes, 0))
+        })
     }
 
     pub fn gpu(&self) -> &Gpu {
@@ -303,7 +323,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         });
-        TexEntry { _texture: texture, bind_group }
+        TexEntry { size: (width, height), _texture: texture, bind_group }
     }
 
     fn ensure_targets(&mut self, width: u32, height: u32) {
@@ -652,7 +672,25 @@ impl Renderer {
                     )),
                 }
             }
-            // テキストなど他の種類は未対応（docs/RENDER_DESIGN.md 参照）
+            EffectKind::Text => {
+                let size = (src.eval("サイズ", rel, 34.0) as f32 * p.zoom).max(1.0);
+                let color_hex = src.text("color").unwrap_or("ffffff");
+                let [cr, cg, cb] = parse_hex_color(color_hex).unwrap_or([1.0, 1.0, 1.0]);
+                let body = src.text("text").unwrap_or_default().replace("\r\n", "\n");
+                let key = (format!("{TEXT_KEY_PREFIX}{size:.1}\0{color_hex}\0{body}"), 0);
+                let entry = match self.textures.get(&key) {
+                    Some(t) => t.clone(),
+                    None => {
+                        let rgb = [(cr * 255.0).round() as u8, (cg * 255.0).round() as u8, (cb * 255.0).round() as u8];
+                        let bitmap = crate::text::rasterize(self.font.as_ref()?, &body, size, rgb)?;
+                        self.media_texture(key, &bitmap)?
+                    }
+                };
+                let (w, h) = entry.size;
+                // 画像は拡大率をラスタライズ時に反映済みなので、スプライトは等倍で置く
+                Some((SpriteUniform { mode: 0, half: [w as f32 / 2.0, h as f32 / 2.0], ..base }, Some(entry)))
+            }
+            // それ以外の種類は未対応（docs/RENDER_DESIGN.md 参照）
             _ => None,
         }
     }

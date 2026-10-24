@@ -19,6 +19,7 @@ mod eval;
 mod gpu;
 mod media;
 mod renderer;
+mod text;
 
 pub use au2_media::RgbaFrame;
 pub use eval::{eval_draw_params, DrawParams};
