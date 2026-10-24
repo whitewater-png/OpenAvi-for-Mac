@@ -59,6 +59,9 @@ fn default_dock() -> DockState<Tab> {
 const SC_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const SC_IMPORT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
 const SC_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const SC_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+const SC_REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const SC_REDO_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
 
 impl OpenAviApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
@@ -76,6 +79,7 @@ impl OpenAviApp {
         log::info!("GPU: {gpu_info}");
 
         let mut st = EditorState::default();
+        st.preview = cc.wgpu_render_state.clone().map(crate::state::PreviewRenderer::new);
         match initial {
             Some(path) => st.load_path(&path),
             None => st.load_exo(SAMPLE_EXO, None),
@@ -103,6 +107,14 @@ fn handle_shortcuts(ctx: &egui::Context, st: &mut EditorState) {
     }
     if ctx.input_mut(|i| i.consume_shortcut(&SC_SAVE)) {
         st.save_project_dialog();
+    }
+    // Redo（Shift 付き）を先に判定しないと、Undo のショートカットに食われる
+    if !ctx.wants_keyboard_input() {
+        if ctx.input_mut(|i| i.consume_shortcut(&SC_REDO) || i.consume_shortcut(&SC_REDO_ALT)) {
+            st.redo();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&SC_UNDO)) {
+            st.undo();
+        }
     }
     if ctx.wants_keyboard_input() {
         return;
@@ -170,6 +182,10 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for OpenAviApp {
+    fn on_exit(&mut self) {
+        self.st.shutdown();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ドラッグ＆ドロップで .aup / .exo / メディア / プラグインを一括処理
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
@@ -177,10 +193,15 @@ impl eframe::App for OpenAviApp {
             self.st.load_path(&path);
         }
 
+        self.st.child_pointer_down = false;
         handle_shortcuts(ctx, &mut self.st);
         self.st.tick();
+        self.st.poll_export();
         if self.st.playing {
             ctx.request_repaint();
+        } else if self.st.export_running() {
+            // 進捗表示のためだけなので、毎フレーム再描画しない
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         self.menu_bar(ctx);
@@ -203,6 +224,11 @@ impl eframe::App for OpenAviApp {
         }
 
         self.plugins_window(ctx);
+
+        // パネルでの編集が済んだ後に、シーンの変化を履歴へ記録する。ドラッグ中と、文字の入力中（テキスト欄にフォーカスがある間）は
+        // 確定を保留し、1 回の操作 = 1 回の Undo にする（実機で、数値を 3 文字入力すると 3 段になっていたため）
+        let stable = !(ctx.input(|i| i.pointer.any_down()) || self.st.child_pointer_down || ctx.wants_keyboard_input());
+        self.st.observe_history(stable);
 
         if self.show_about {
             egui::Window::new("OpenAvi について")
@@ -276,6 +302,15 @@ impl OpenAviApp {
                         ui.close_menu();
                         self.st.export_exo_dialog();
                     }
+                    if self.st.export_running() {
+                        if ui.button("⏹ 動画の書き出しをキャンセル").clicked() {
+                            ui.close_menu();
+                            self.st.cancel_export();
+                        }
+                    } else if ui.button("🎞 動画を書き出し (MP4)...").clicked() {
+                        ui.close_menu();
+                        self.st.export_video_dialog();
+                    }
                     ui.separator();
                     if ui.button("🔄 サンプルプロジェクトを再読み込み").clicked() {
                         self.st.load_exo(SAMPLE_EXO, None);
@@ -284,6 +319,18 @@ impl OpenAviApp {
                     ui.separator();
                     if ui.button("終了").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("編集", |ui| {
+                    let undo = egui::Button::new("↩ 元に戻す").shortcut_text(ctx.format_shortcut(&SC_UNDO));
+                    if ui.add_enabled(self.st.history.can_undo(), undo).clicked() {
+                        ui.close_menu();
+                        self.st.undo();
+                    }
+                    let redo = egui::Button::new("↪ やり直し").shortcut_text(ctx.format_shortcut(&SC_REDO));
+                    if ui.add_enabled(self.st.history.can_redo(), redo).clicked() {
+                        ui.close_menu();
+                        self.st.redo();
                     }
                 });
                 ui.menu_button("表示", |ui| {
@@ -438,6 +485,8 @@ impl OpenAviApp {
                         egui::Window::new(tab.title()).default_size(size).show(ctx, |ui| panel_ui(tab, ui, st));
                     } else {
                         handle_shortcuts(ctx, st);
+                        // egui の入力はウィンドウ（viewport）ごと。子ウィンドウでのドラッグ中も Undo を保留する
+                        st.child_pointer_down |= ctx.input(|i| i.pointer.any_down());
                         egui::CentralPanel::default().show(ctx, |ui| panel_ui(tab, ui, st));
                         if ctx.input(|i| i.viewport().close_requested()) {
                             closed = true;

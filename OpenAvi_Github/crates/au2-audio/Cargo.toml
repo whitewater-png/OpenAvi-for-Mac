@@ -1,0 +1,17 @@
+[package]
+name = "au2-audio"
+description = "OpenAvi audio decoding, mixing and playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["output"]
+# cpal による実機出力。Linux では ALSA の開発ヘッダ（libasound2-dev）が必要
+output = ["dep:cpal"]
+
+[dependencies]
+au2-core.workspace = true
+au2-media.workspace = true
+log.workspace = true
+cpal = { version = "0.15", optional = true }

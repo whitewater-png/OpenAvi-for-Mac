@@ -3,6 +3,7 @@
 
 mod app;
 mod fonts;
+mod history;
 mod panels;
 mod state;
 

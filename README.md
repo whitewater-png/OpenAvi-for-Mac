@@ -50,6 +50,9 @@ openavi/
     ├── au2-aup/              # AviUtl プロジェクトファイル (.aup) バイナリパーサー & ライター
     ├── au2-exo/              # 拡張編集オブジェクトファイル (.exo) パーサー & シリアライザ
     ├── au2-media/            # 画像・動画デコーダ & フレームキャッシュ
+    ├── au2-render/           # ヘッドレス GPU 合成エンジン（試作: 図形・画像・テキスト・色調補正）
+    ├── au2-audio/            # 音声のデコード・ミキシング・再生
+    ├── au2-export/           # 動画書き出し（描画＋ミックス＋ffmpeg エンコード）
     ├── au2-plugin/           # スクリプト (.anm/.obj等) & DLLプラグイン (.auf/.aui等) ローダー・検査器
     └── au2-app/              # デスクトップ GUI アプリケーション (バイナリ名: openavi)
 ```
@@ -58,11 +61,22 @@ openavi/
 
 ## ダウンロード＆ワンクリック起動（一般ユーザー向け）
 
+### Windows
+
 1. GitHub の **Releases** ページから最新の **`OpenAvi-windows-x64.zip`** をダウンロードして解凍します。
 2. 解凍したフォルダ内の **`install.bat`** をダブルクリックすると：
    - `%LOCALAPPDATA%\Programs\OpenAvi` にアプリ本体・サンプル・プラグインがインストールされます。
    - **デスクトップ** と **スタートメニュー** に **「OpenAvi」アイコン** が自動作成されます。
 3. 以降はデスクトップの **「OpenAvi」アイコンをワンクリック（ダブルクリック）するだけ** で即座に起動できます（ポータブル版としてフォルダ内の `openavi.exe` または `Launch-OpenAvi.bat` を直接クリックして起動することも可能です）。
+
+### macOS
+
+1. **`OpenAvi-macos-arm64.zip`**（Apple Silicon 用）を解凍し、**`OpenAvi.app`** を「アプリケーション」フォルダへドラッグします。
+2. Developer ID 署名・公証をしていないため、初回起動は Gatekeeper に止められます。一度ダブルクリックしてから、**システム設定 → プライバシーとセキュリティ** の「このまま開く」を押してください（macOS 14 以前は右クリック →「開く」でも可）。ターミナルで `xattr -dr com.apple.quarantine /Applications/OpenAvi.app` を実行しても解除できます。
+3. 動画の読み込みには FFmpeg が必要です。Homebrew で `brew install ffmpeg` してください（`/opt/homebrew/bin`・`/usr/local/bin`・`/opt/local/bin` を自動検出します）。
+4. `.app` から起動した場合、プラグイン・スクリプトは `~/Library/Application Support/OpenAvi/plugins` に保存されます（初回起動時・アップデート時に、未導入の同梱プラグインがコピーされます。`cargo run` で起動した場合はリポジトリの `plugins/` を使います）。
+
+> **注意**: `.auf` / `.aui` / `.auo` / `.auc` は Windows 用 DLL のため、macOS では一覧表示・検査のみで実行はできません（Windows 版でも実行ブリッジは今後の予定です）。
 
 ---
 
@@ -77,7 +91,14 @@ cargo run --release -p au2-app
 
 # 配布用 ZIP パッケージ (dist/OpenAvi-windows-x64.zip) の生成 & デスクトップショートカット作成
 powershell -ExecutionPolicy Bypass -File .\package-release.ps1
+
+# macOS: dist/OpenAvi.app と dist/OpenAvi-macos-<arch>.zip の生成（アドホック署名）
+./package-macos.sh
 ```
+
+macOS で Rust が未導入の場合は、[rustup](https://rustup.rs/) でインストールしてください。
+
+Linux でビルドする場合は、音声出力（cpal）のために `libasound2-dev` と `pkg-config` が必要です（`sudo apt install libasound2-dev pkg-config`）。動画の読み込み・書き出し・音声のデコードには、どの OS でも FFmpeg が必要です。
 
 ---
 
