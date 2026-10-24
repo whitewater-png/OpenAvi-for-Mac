@@ -6,6 +6,8 @@
 //! - **アニメーション GIF**: 全フレームを展開し、タイムラインのフレーム位置に応じてアニメーション再生。
 //! - **動画ファイル**: `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.wmv` 等を `ffmpeg` パイプライン（PATH・Homebrew 等の標準パス・WinGet 領域から自動検出）で RGBA フレームへデコードし、メモリキャッシュします。
 
+mod stream;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,10 @@ enum CachedAsset {
     VideoInfo {
         width: u32,
         height: u32,
+        /// 動画のネイティブフレームレート（時刻 → フレーム番号の変換に使う）
+        fps: f64,
+        /// 常駐デコーダ（再生・コマ送りの連続アクセス用）
+        stream: Option<stream::VideoStream>,
         frames: HashMap<u32, RgbaFrame>,
     },
     Failed,
@@ -104,19 +110,19 @@ impl MediaCache {
         }
 
         // 動画の場合、要求フレームが未キャッシュならデコード
-        if let Some(CachedAsset::VideoInfo { width, height, frames }) = self.assets.get(path) {
-            let (w, h) = (*width, *height);
-            // 3フレーム粒度でキャッシュヒット率を高める（または正確なフレーム番号）
-            if !frames.contains_key(&frame_index) {
-                if let Some(ffmpeg) = self.ffmpeg_bin.clone() {
-                    if let Some(decoded) = decode_video_frame_ffmpeg(&ffmpeg, path, time_sec, w, h) {
-                        if let Some(CachedAsset::VideoInfo { frames, .. }) = self.assets.get_mut(path) {
-                            // メモリ上限保護（最大 180 フレーム保持）
-                            if frames.len() >= 180 {
-                                frames.clear();
-                            }
-                            frames.insert(frame_index, decoded);
+        let missing = matches!(
+            self.assets.get(path),
+            Some(CachedAsset::VideoInfo { frames, .. }) if !frames.contains_key(&frame_index)
+        );
+        if missing {
+            if let Some(ffmpeg) = self.ffmpeg_bin.clone() {
+                if let Some(CachedAsset::VideoInfo { width, height, fps, stream, frames }) = self.assets.get_mut(path) {
+                    if let Some(decoded) = decode_video_frame(&ffmpeg, path, time_sec, *fps, (*width, *height), stream) {
+                        // メモリ上限保護（最大 180 フレーム保持）
+                        if frames.len() >= 180 {
+                            frames.clear();
                         }
+                        frames.insert(frame_index, decoded);
                     }
                 }
             }
@@ -136,16 +142,16 @@ impl MediaCache {
         let Some(ffmpeg) = &self.ffmpeg_bin else {
             return CachedAsset::Failed;
         };
-        let (width, height) = self
+        let (width, height, fps) = self
             .ffprobe_bin
             .as_ref()
-            .and_then(|probe| probe_video_dimensions(probe, path))
-            .unwrap_or((640, 360));
+            .and_then(|probe| probe_video(probe, path))
+            .unwrap_or((640, 360, 30.0));
 
         let mut frames = HashMap::new();
         if let Some(first) = decode_video_frame_ffmpeg(ffmpeg, path, 0.0, width, height) {
             frames.insert(0, first);
-            CachedAsset::VideoInfo { width, height, frames }
+            CachedAsset::VideoInfo { width, height, fps, stream: None, frames }
         } else {
             CachedAsset::Failed
         }
@@ -264,7 +270,8 @@ fn find_file_recursive(dir: &Path, target_name: &str, depth: u8) -> Option<PathB
     None
 }
 
-fn probe_video_dimensions(ffprobe: &Path, video_path: &Path) -> Option<(u32, u32)> {
+/// 動画の (幅, 高さ, フレームレート)。幅・高さはプレビュー用に縮小後の値。
+fn probe_video(ffprobe: &Path, video_path: &Path) -> Option<(u32, u32, f64)> {
     let mut cmd = Command::new(ffprobe);
     #[cfg(windows)]
     {
@@ -278,7 +285,7 @@ fn probe_video_dimensions(ffprobe: &Path, video_path: &Path) -> Option<(u32, u32
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height",
+            "stream=width,height,r_frame_rate",
             "-of",
             "csv=s=x:p=0",
         ])
@@ -287,15 +294,48 @@ fn probe_video_dimensions(ffprobe: &Path, video_path: &Path) -> Option<(u32, u32
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().next()?.trim();
-    let (w, h) = line.split_once('x')?;
-    let width: u32 = w.parse().ok()?;
-    let height: u32 = h.parse().ok()?;
+    let mut parts = line.split('x');
+    let width: u32 = parts.next()?.parse().ok()?;
+    let height: u32 = parts.next()?.parse().ok()?;
+    let fps = parts
+        .next()
+        .and_then(|r| {
+            let (n, d) = r.split_once('/')?;
+            Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?)
+        })
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(30.0);
     // プレビュー負荷軽減のため長辺 960px 以下にスケーリング
     if width > 960 {
         let scaled_h = (height as f64 * 960.0 / width as f64).round() as u32;
-        Some((960, (scaled_h.max(2) / 2) * 2))
+        Some((960, (scaled_h.max(2) / 2) * 2, fps))
     } else {
-        Some((width.max(2), height.max(2)))
+        Some((width.max(2), height.max(2), fps))
+    }
+}
+
+/// 常駐デコーダでフレームを取得します。後戻りや大きなシークでは再起動し、起動できなければ 1 枚だけ個別にデコードします。
+fn decode_video_frame(
+    ffmpeg: &Path,
+    path: &Path,
+    time_sec: f64,
+    fps: f64,
+    (width, height): (u32, u32),
+    stream: &mut Option<stream::VideoStream>,
+) -> Option<RgbaFrame> {
+    let index = (time_sec.max(0.0) * fps).round() as u64;
+    if let Some(frame) = stream.as_mut().and_then(|s| s.frame_at(index)) {
+        return Some(frame);
+    }
+    // 終端を越えるシークでは新しいストリームが 1 枚も出さないので、直前に出していた最後のフレームを保持表示する
+    let held = stream.as_ref().and_then(|s| s.last_frame());
+    *stream = stream::VideoStream::spawn(ffmpeg, path, index, fps, width, height);
+    match stream.as_mut().and_then(|s| s.frame_at(index)) {
+        Some(frame) => Some(frame),
+        None => {
+            *stream = None;
+            held.or_else(|| decode_video_frame_ffmpeg(ffmpeg, path, time_sec, width, height))
+        }
     }
 }
 
@@ -372,6 +412,24 @@ mod tests {
             let vid_frame = cache.get_frame(vid_path, 15, 0.5).expect("decode sample_video.mp4");
             assert_eq!((vid_frame.width, vid_frame.height), (320, 180));
             assert_eq!(vid_frame.pixels.len(), 320 * 180 * 4);
+        }
+    }
+
+    #[test]
+    fn streaming_decode_matches_single_frame_decode() {
+        let mut cache = MediaCache::new();
+        let Some(ffmpeg) = cache.ffmpeg_bin.clone() else { return };
+        let path = Path::new("../../samples/sample_video.mp4");
+        let fps = 30.0;
+        // 前進（連続・読み捨てを含む）→ 後戻り → 終端超過の順にアクセス
+        let order: Vec<u32> = [0, 1, 2, 3, 10, 11, 5, 40, 41, 59, 200].to_vec();
+        for &i in &order {
+            let t = i as f64 / fps;
+            let streamed = cache.get_frame(path, i, t).unwrap_or_else(|| panic!("frame {i}")).clone();
+            assert_eq!((streamed.width, streamed.height), (320, 180));
+            let reference = decode_video_frame_ffmpeg(&ffmpeg, path, (t.min(59.0 / fps) - 0.5 / fps).max(0.0), 320, 180).unwrap();
+            let max_diff = streamed.pixels.iter().zip(&reference.pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(max_diff <= 2, "frame {i}: 単独デコードと {max_diff} ずれている");
         }
     }
 }
