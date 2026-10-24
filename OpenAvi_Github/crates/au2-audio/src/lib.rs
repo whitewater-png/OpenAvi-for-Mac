@@ -9,7 +9,7 @@ mod mixer;
 #[cfg(feature = "output")]
 mod output;
 
-pub use mixer::{mix, AudioCache};
+pub use mixer::{mix, mix_project, AudioCache};
 #[cfg(feature = "output")]
 pub use output::AudioPlayer;
 

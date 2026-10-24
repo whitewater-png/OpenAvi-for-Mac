@@ -661,6 +661,7 @@ fn previous_object_redraws_the_previous_image_at_its_own_position() {
     let f = r.render(&s, 0, &mut NoMedia).unwrap();
     assert_near(px(&f, 25, 25), [255, 0, 255, 255], 1, "元のオブジェクト");
     assert_near(px(&f, 75, 25), [255, 0, 255, 255], 1, "直前オブジェクトの位置に同じ絵");
+    assert_near(px(&f, 75 + 8, 25), [255, 0, 255, 255], 1, "直前オブジェクト自身の拡大率（20x20）の内側");
     assert_near(px(&f, 75 + 12, 25), [0, 0, 0, 255], 1, "直前オブジェクト自身の拡大率（20x20）");
     assert_near(px(&f, 25 + 15, 25), [255, 0, 255, 255], 1, "元は 40x40 のまま");
 }
