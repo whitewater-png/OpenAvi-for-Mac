@@ -1,0 +1,18 @@
+[package]
+name = "au2-export"
+description = "OpenAvi video export (render + mix + ffmpeg encode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+au2-core.workspace = true
+au2-media.workspace = true
+au2-render.workspace = true
+# 書き出しはヘッドレスで動くので、実機出力（cpal）は不要
+au2-audio.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+image.workspace = true

@@ -7,6 +7,8 @@ members = [
     "crates/au2-media",
     "crates/au2-plugin",
     "crates/au2-render",
+    "crates/au2-audio",
+    "crates/au2-export",
     "crates/au2-app",
 ]
 default-members = ["crates/au2-app"]
@@ -25,6 +27,8 @@ au2-aup = { path = "crates/au2-aup" }
 au2-media = { path = "crates/au2-media" }
 au2-plugin = { path = "crates/au2-plugin" }
 au2-render = { path = "crates/au2-render" }
+au2-audio = { path = "crates/au2-audio", default-features = false }
+au2-export = { path = "crates/au2-export" }
 encoding_rs = "0.8"
 thiserror = "1"
 log = "0.4"

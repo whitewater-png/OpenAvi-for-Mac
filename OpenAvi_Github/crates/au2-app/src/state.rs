@@ -1,6 +1,8 @@
 //! エディタの状態（UI から独立したアプリケーション状態）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -9,6 +11,8 @@ use au2_exo::TextEncoding;
 use au2_media::{MediaCache, MediaKind, RgbaFrame};
 use au2_render::{MediaSource, Renderer};
 use au2_plugin::PluginRegistry;
+
+use crate::history::History;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 /// 同梱サンプル（Shift_JIS）。
@@ -115,6 +119,24 @@ fn resolve_media_path(path_str: &str) -> PathBuf {
     path
 }
 
+/// 再生用の音声（ミックス済みバッファを cpal で鳴らす）。
+pub struct AudioState {
+    player: au2_audio::AudioPlayer,
+    cache: au2_audio::AudioCache,
+}
+
+/// ライブ再生用にミックスする最大の長さ（秒）。再生開始時に先頭からまとめて作る。
+const MAX_LIVE_AUDIO_SECS: f64 = 600.0;
+
+/// バックグラウンドで動いている動画書き出し。
+pub struct ExportJob {
+    done: Arc<AtomicU32>,
+    total: Arc<AtomicU32>,
+    cancel: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Result<(), au2_export::ExportError>>,
+    output: PathBuf,
+}
+
 pub struct EditorState {
     pub scene: Scene,
     /// 現在のプロジェクトファイルパス（`.aup` または `.exo`）
@@ -139,6 +161,10 @@ pub struct EditorState {
     pub dirty: bool,
     /// GPU プレビュー描画（起動時に eframe から wgpu を受け取れた場合のみ）
     pub preview: Option<PreviewRenderer>,
+    pub audio: AudioState,
+    /// Undo / Redo（`scene` のスナップショット履歴）
+    pub history: History<Scene>,
+    pub export: Option<ExportJob>,
 }
 
 fn resolve_app_path(rel: &str) -> Option<PathBuf> {
@@ -252,8 +278,10 @@ fn initial_sources() -> Vec<SourceMediaItem> {
 
 impl Default for EditorState {
     fn default() -> Self {
+        let scene = Scene::new("Root", SceneSettings::default());
         Self {
-            scene: Scene::new("Root", SceneSettings::default()),
+            history: History::new(&scene),
+            scene,
             file_path: None,
             encoding: TextEncoding::ShiftJis,
             frame: 0,
@@ -270,6 +298,8 @@ impl Default for EditorState {
             textures: HashMap::new(),
             dirty: false,
             preview: None,
+            audio: AudioState { player: au2_audio::AudioPlayer::new(), cache: au2_audio::AudioCache::new() },
+            export: None,
         }
     }
 }
@@ -307,6 +337,7 @@ impl EditorState {
         self.frame = frame.min(self.last_frame());
         if self.playing {
             self.play_origin = Some((Instant::now(), self.frame));
+            self.restart_audio();
         }
     }
 
@@ -318,6 +349,62 @@ impl EditorState {
     pub fn toggle_play(&mut self) {
         self.playing = !self.playing;
         self.play_origin = self.playing.then(|| (Instant::now(), self.frame));
+        self.restart_audio();
+    }
+
+    /// 現在フレームから音声を鳴らし直します（停止中なら止めるだけ）。
+    fn restart_audio(&mut self) {
+        self.audio.player.stop();
+        if !self.playing {
+            return;
+        }
+        let fps = self.scene.settings.frame_rate.as_f64();
+        let from = self.frame;
+        let end = (self.last_frame() + 1).min(from + (MAX_LIVE_AUDIO_SECS * fps) as Frame);
+        let mixed = au2_audio::mix(&self.scene, &mut self.audio.cache, from, end, &resolve_media_path);
+        if mixed.iter().all(|&v| v == 0.0) {
+            return;
+        }
+        if let Err(e) = self.audio.player.play(Arc::new(mixed)) {
+            log::warn!("音声を再生できません: {e}");
+        }
+    }
+
+    /// ファイルを開いた・新規作成した直後の後始末（履歴と音声を捨てる）。
+    fn scene_replaced(&mut self) {
+        self.history.reset(&self.scene);
+        self.audio.player.stop();
+    }
+
+    /// 毎フレーム、UI の最後に呼ぶ。`stable` はマウスボタンが押されていない（操作の途中でない）こと。
+    pub fn observe_history(&mut self, stable: bool) {
+        if self.history.observe(&self.scene, stable) {
+            self.dirty = true;
+        }
+    }
+
+    pub fn undo(&mut self) {
+        if self.history.undo(&mut self.scene) {
+            self.after_history_jump("元に戻しました");
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if self.history.redo(&mut self.scene) {
+            self.after_history_jump("やり直しました");
+        }
+    }
+
+    fn after_history_jump(&mut self, message: &str) {
+        self.dirty = true;
+        self.status = message.into();
+        if self.selected.is_some_and(|id| self.scene.find(id).is_none()) {
+            self.selected = None;
+        }
+        self.frame = self.frame.min(self.last_frame());
+        if self.playing {
+            self.restart_audio();
+        }
     }
 
     /// 再生中なら経過時間からフレームを進めます（末尾でループ）。
@@ -325,11 +412,88 @@ impl EditorState {
         let Some((origin, start)) = self.play_origin.filter(|_| self.playing) else { return };
         let fps = self.scene.settings.frame_rate;
         let mut f = start + fps.seconds_to_frame(origin.elapsed().as_secs_f64());
-        if f > self.last_frame() {
+        let wrapped = f > self.last_frame();
+        if wrapped {
             f = 0;
             self.play_origin = Some((Instant::now(), 0));
         }
         self.frame = f;
+        if wrapped {
+            self.restart_audio();
+        }
+    }
+
+    pub fn export_running(&self) -> bool {
+        self.export.is_some()
+    }
+
+    /// 書き出し先を選んで、バックグラウンドで動画（MP4 / H.264 + AAC）を書き出します。
+    pub fn export_video_dialog(&mut self) {
+        if self.export.is_some() {
+            self.status = "すでに書き出し中です".into();
+            return;
+        }
+        let Some(mut output) = rfd::FileDialog::new()
+            .set_title("動画を書き出し")
+            .add_filter("MP4 動画 (H.264 + AAC)", &["mp4"])
+            .set_file_name("openavi.mp4")
+            .save_file()
+        else {
+            return;
+        };
+        if output.extension().is_none() {
+            output.set_extension("mp4");
+        }
+        let scene = self.scene.clone();
+        let (done, total, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)));
+        let (d, t, c, out) = (done.clone(), total.clone(), cancel.clone(), output.clone());
+        let handle = std::thread::spawn(move || {
+            // 書き出しはプレビューとは別の GPU デバイス・別のメディアキャッシュで動かす
+            let mut renderer = Renderer::new(au2_render::Gpu::headless()?);
+            renderer.load_system_font();
+            let mut cache = MediaCache::new();
+            let mut progress = |n: u32, all: u32| {
+                d.store(n, Ordering::Relaxed);
+                t.store(all, Ordering::Relaxed);
+                !c.load(Ordering::Relaxed)
+            };
+            au2_export::export_video(
+                &scene,
+                &au2_export::ExportOptions::new(out),
+                &mut renderer,
+                &mut ResolvingMedia(&mut cache),
+                &resolve_media_path,
+                &mut progress,
+            )
+        });
+        self.status = format!("書き出しを開始しました: {}", output.display());
+        self.export = Some(ExportJob { done, total, cancel, handle, output });
+    }
+
+    pub fn cancel_export(&mut self) {
+        if let Some(job) = &self.export {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 書き出しの進捗をステータスに反映し、終わっていれば結果を報告します。毎フレーム呼ぶ。
+    pub fn poll_export(&mut self) {
+        let Some(job) = &self.export else { return };
+        if !job.handle.is_finished() {
+            let (d, t) = (job.done.load(Ordering::Relaxed), job.total.load(Ordering::Relaxed));
+            self.status = format!("書き出し中… {d} / {t} フレーム");
+            return;
+        }
+        let job = self.export.take().expect("確認済み");
+        self.status = match job.handle.join() {
+            Ok(Ok(())) => format!("書き出しが完了しました: {}", job.output.display()),
+            Ok(Err(au2_export::ExportError::Cancelled)) => "書き出しをキャンセルしました".into(),
+            Ok(Err(e)) => {
+                log::error!("書き出しに失敗: {e}");
+                format!("書き出しに失敗しました: {e}")
+            }
+            Err(_) => "書き出しスレッドが異常終了しました".into(),
+        };
     }
 
     pub fn new_scene(&mut self) {
@@ -339,8 +503,15 @@ impl EditorState {
             timeline: std::mem::take(&mut self.timeline),
             plugins,
             sources,
+            preview: self.preview.take(),
+            audio: AudioState {
+                player: std::mem::take(&mut self.audio.player),
+                cache: std::mem::take(&mut self.audio.cache),
+            },
+            export: self.export.take(),
             ..Self::default()
         };
+        self.audio.player.stop();
         self.status = "新規プロジェクトを作成しました".into();
     }
 
@@ -505,6 +676,7 @@ impl EditorState {
                     doc.scene.object_count()
                 );
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
                 self.selected = None;
@@ -533,6 +705,7 @@ impl EditorState {
                     doc.scene.object_count()
                 );
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
                 self.selected = None;
@@ -565,6 +738,7 @@ impl EditorState {
                     log::warn!("{w}");
                 }
                 self.scene = doc.scene;
+                self.scene_replaced();
                 self.encoding = doc.encoding;
                 self.warnings = doc.warnings;
                 self.file_path = path.map(Path::to_path_buf);
@@ -760,5 +934,39 @@ impl EditorState {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_redo_restores_scene_and_drops_stale_selection() {
+        let mut st = EditorState::default();
+        let before = st.scene.clone();
+        let obj = TimelineObject::new_shape(0, 29, 1, "ff0000");
+        let id = obj.id;
+        st.scene.insert_object(0, obj);
+        st.selected = Some(id);
+        st.observe_history(false);
+        assert!(!st.history.can_undo(), "操作中は記録しない");
+        st.observe_history(true);
+        assert!(st.history.can_undo());
+
+        st.undo();
+        assert_eq!(st.scene, before);
+        assert_eq!(st.selected, None, "消えたオブジェクトの選択は外れる");
+        st.redo();
+        assert!(st.scene.find(id).is_some());
+    }
+
+    #[test]
+    fn new_scene_keeps_nothing_to_undo() {
+        let mut st = EditorState::default();
+        st.scene.insert_object(0, TimelineObject::new_shape(0, 9, 1, "00ff00"));
+        st.observe_history(true);
+        st.new_scene();
+        assert!(!st.history.can_undo());
     }
 }

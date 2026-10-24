@@ -202,6 +202,11 @@ fn load_gif_or_static(path: &Path) -> CachedAsset {
     load_static_image(path)
 }
 
+/// ffmpeg の実行ファイルを探します（音声デコード・書き出しなど他クレートからも使う）。
+pub fn locate_ffmpeg() -> Option<PathBuf> {
+    locate_ffmpeg_tools().0
+}
+
 fn locate_ffmpeg_tools() -> (Option<PathBuf>, Option<PathBuf>) {
     // 1. PATH から検索
     if Command::new("ffmpeg")

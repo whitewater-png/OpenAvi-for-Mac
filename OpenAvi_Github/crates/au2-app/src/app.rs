@@ -59,6 +59,9 @@ fn default_dock() -> DockState<Tab> {
 const SC_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const SC_IMPORT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
 const SC_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const SC_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+const SC_REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const SC_REDO_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
 
 impl OpenAviApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
@@ -104,6 +107,14 @@ fn handle_shortcuts(ctx: &egui::Context, st: &mut EditorState) {
     }
     if ctx.input_mut(|i| i.consume_shortcut(&SC_SAVE)) {
         st.save_project_dialog();
+    }
+    // Redo（Shift 付き）を先に判定しないと、Undo のショートカットに食われる
+    if !ctx.wants_keyboard_input() {
+        if ctx.input_mut(|i| i.consume_shortcut(&SC_REDO) || i.consume_shortcut(&SC_REDO_ALT)) {
+            st.redo();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&SC_UNDO)) {
+            st.undo();
+        }
     }
     if ctx.wants_keyboard_input() {
         return;
@@ -180,7 +191,8 @@ impl eframe::App for OpenAviApp {
 
         handle_shortcuts(ctx, &mut self.st);
         self.st.tick();
-        if self.st.playing {
+        self.st.poll_export();
+        if self.st.playing || self.st.export_running() {
             ctx.request_repaint();
         }
 
@@ -204,6 +216,10 @@ impl eframe::App for OpenAviApp {
         }
 
         self.plugins_window(ctx);
+
+        // パネルでの編集が済んだ後に、シーンの変化を履歴へ記録する（ドラッグ中は確定を保留）
+        let stable = !ctx.input(|i| i.pointer.any_down());
+        self.st.observe_history(stable);
 
         if self.show_about {
             egui::Window::new("OpenAvi について")
@@ -277,6 +293,15 @@ impl OpenAviApp {
                         ui.close_menu();
                         self.st.export_exo_dialog();
                     }
+                    if self.st.export_running() {
+                        if ui.button("⏹ 動画の書き出しをキャンセル").clicked() {
+                            ui.close_menu();
+                            self.st.cancel_export();
+                        }
+                    } else if ui.button("🎞 動画を書き出し (MP4)...").clicked() {
+                        ui.close_menu();
+                        self.st.export_video_dialog();
+                    }
                     ui.separator();
                     if ui.button("🔄 サンプルプロジェクトを再読み込み").clicked() {
                         self.st.load_exo(SAMPLE_EXO, None);
@@ -285,6 +310,18 @@ impl OpenAviApp {
                     ui.separator();
                     if ui.button("終了").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("編集", |ui| {
+                    let undo = egui::Button::new("↩ 元に戻す").shortcut_text(ctx.format_shortcut(&SC_UNDO));
+                    if ui.add_enabled(self.st.history.can_undo(), undo).clicked() {
+                        ui.close_menu();
+                        self.st.undo();
+                    }
+                    let redo = egui::Button::new("↪ やり直し").shortcut_text(ctx.format_shortcut(&SC_REDO));
+                    if ui.add_enabled(self.st.history.can_redo(), redo).clicked() {
+                        ui.close_menu();
+                        self.st.redo();
                     }
                 });
                 ui.menu_button("表示", |ui| {
