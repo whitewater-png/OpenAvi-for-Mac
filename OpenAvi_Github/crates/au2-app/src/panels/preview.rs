@@ -4,7 +4,7 @@
 //! - 画像ファイル（`.png`, `.jpg`, `.bmp`, `.webp`, `.gif`）および動画ファイル（`.mp4`, `.avi`, `.mov`, `.mkv` 等）は
 //!   [`au2_media::MediaCache`] を通じてデコードされ、GPU テクスチャとして回転・拡大率・透明度付きで描画されます。
 
-use eframe::egui::{self, emath::Rot2, pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke};
 
 use crate::state::EditorState;
 
@@ -44,14 +44,16 @@ pub fn ui(ui: &mut egui::Ui, st: &mut EditorState) {
         }
     }
 
-    // 選択中オブジェクトの枠（回転に追従する）
+    // 選択中オブジェクトの枠（回転・3D の射影に追従する。四隅を中心から 2px 外へ広げる）
     if let Some(b) = st.selected.and_then(|id| st.preview.as_ref()?.renderer.object_bounds(id)) {
         let center = canvas.center() + vec2(b.center[0], b.center[1]) * scale;
-        let rot = Rot2::from_angle(b.angle);
-        let (hx, hy) = (b.half[0] * scale + 2.0, b.half[1] * scale + 2.0);
-        let corners: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-            .into_iter()
-            .map(|(sx, sy)| center + rot * vec2(sx * hx, sy * hy))
+        let corners: Vec<Pos2> = b
+            .corners
+            .iter()
+            .map(|c| {
+                let p = canvas.center() + vec2(c[0], c[1]) * scale;
+                p + (p - center).normalized() * 2.0
+            })
             .collect();
         painter.add(Shape::closed_line(corners, Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 0))));
     }

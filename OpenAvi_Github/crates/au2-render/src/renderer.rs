@@ -9,7 +9,8 @@ use au2_media::RgbaFrame;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::eval::{eval_draw_params, DrawParams};
+use crate::eval::{eval_draw_params, Controls, DrawParams, Homography};
+pub use crate::eval::ObjectBounds;
 use crate::gpu::Gpu;
 use crate::media::MediaSource;
 use crate::RenderError;
@@ -47,7 +48,8 @@ struct SpriteUniform {
     shape: u32,
     sides: u32,
     _pad: u32,
-    /// 拡張描画・3D・カメラ用の予約領域（頂点シェーダが使う。段階 B の「拡張描画/カメラ」担当が所有）
+    /// 拡張描画・3D・カメラ: 物体ローカル座標 → 画面座標の射影変換（頂点シェーダが使う）。
+    /// 並びは `eval::Homography::to_ext`。全て 0 なら `center` / `angle` による 2D 配置
     ext: [f32; 16],
     /// 合成モード・クリッピング用の予約領域（フラグメントシェーダが使う。段階 B の「合成/クリッピング」担当が所有）
     blend: [u32; 4],
@@ -60,16 +62,6 @@ struct ColorCorrectionUniform {
     a: [f32; 4],
     /// 彩度（倍率）
     b: [f32; 4],
-}
-
-/// 直近の描画での、オブジェクトの描画範囲（回転した矩形）。選択枠などの UI 用。
-/// 座標はシーン中心基準のピクセル（+y 下）、`half` は回転前の半サイズ。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ObjectBounds {
-    pub center: [f32; 2],
-    pub half: [f32; 2],
-    /// ラジアン（正 = 時計回り）
-    pub angle: f32,
 }
 
 struct TexEntry {
@@ -506,6 +498,8 @@ impl Renderer {
         let canvas = [width as f32, height as f32];
         let fps = scene.settings.frame_rate.as_f64();
         self.bounds.clear();
+        // グループ制御・カメラ制御（レイヤー順に登録し、下のオブジェクトに掛ける）
+        let mut controls = Controls::new(canvas[1]);
 
         for (li, obj) in scene.objects_at(frame) {
             if !scene.layers[li].visible {
@@ -515,15 +509,20 @@ impl Renderer {
             let rel = frame - obj.frame_start;
             match obj.category() {
                 ObjectCategory::Media => {
-                    let params = eval_draw_params(obj, rel, fps);
+                    let params = controls.apply(li, obj, eval_draw_params(obj, rel, fps));
                     if params.alpha <= 0.0 {
                         continue;
                     }
                     if let Some((uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
-                        self.bounds.insert(
-                            obj.id,
-                            ObjectBounds { center: uniform.center, half: uniform.half, angle: uniform.angle },
-                        );
+                        // 裏面（裏面を表示しない）と、丸ごとカメラの後ろにあるものは描かない
+                        let h = Homography::from_ext(&uniform.ext)
+                            .unwrap_or_else(|| Homography::flat(uniform.center, uniform.angle));
+                        if (params.cull_back && h.is_back_facing()) || h.is_behind_camera(uniform.half) {
+                            continue;
+                        }
+                        if let Some(b) = ObjectBounds::project(&h, uniform.half) {
+                            self.bounds.insert(obj.id, b);
+                        }
                         let offset = sprite_bytes.len() as u32;
                         sprite_bytes.extend_from_slice(bytemuck::bytes_of(&uniform));
                         sprite_bytes.resize((offset + sprite_stride) as usize, 0);
@@ -548,6 +547,7 @@ impl Renderer {
                     filter_bytes.resize((offset + filter_stride) as usize, 0);
                     ops.push(Op::ColorCorrection { offset });
                 }
+                ObjectCategory::Control => controls.observe(li, obj, rel),
                 _ => {}
             }
         }
@@ -763,7 +763,7 @@ impl Renderer {
             shape: SHAPE_BOX,
             sides: 0,
             _pad: 0,
-            ext: [0.0; 16],
+            ext: p.homography().to_ext(),
             blend: [0; 4],
         };
         match src.kind {
@@ -778,6 +778,7 @@ impl Renderer {
                         u.center = [0.0, 0.0];
                         u.angle = 0.0;
                         u.half = [canvas[0] / 2.0, canvas[1] / 2.0];
+                        u.ext = [0.0; 16];
                     }
                     1 => u.shape = SHAPE_CIRCLE,
                     2 => u.shape = SHAPE_BOX,
