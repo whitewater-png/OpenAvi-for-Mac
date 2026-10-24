@@ -15,6 +15,7 @@
 //! # }
 //! ```
 
+mod blend;
 mod eval;
 mod gpu;
 mod media;
@@ -22,6 +23,7 @@ mod renderer;
 mod text;
 
 pub use au2_media::RgbaFrame;
+pub use blend::BlendMode;
 pub use eval::{eval_draw_params, DrawParams};
 pub use gpu::Gpu;
 pub use media::{MediaSource, NoMedia};
