@@ -225,8 +225,9 @@ impl eframe::App for OpenAviApp {
 
         self.plugins_window(ctx);
 
-        // パネルでの編集が済んだ後に、シーンの変化を履歴へ記録する（ドラッグ中は確定を保留）
-        let stable = !(ctx.input(|i| i.pointer.any_down()) || self.st.child_pointer_down);
+        // パネルでの編集が済んだ後に、シーンの変化を履歴へ記録する。ドラッグ中と、文字の入力中（テキスト欄にフォーカスがある間）は
+        // 確定を保留し、1 回の操作 = 1 回の Undo にする（実機で、数値を 3 文字入力すると 3 段になっていたため）
+        let stable = !(ctx.input(|i| i.pointer.any_down()) || self.st.child_pointer_down || ctx.wants_keyboard_input());
         self.st.observe_history(stable);
 
         if self.show_about {
