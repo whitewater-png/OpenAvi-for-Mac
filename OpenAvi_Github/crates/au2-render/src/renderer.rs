@@ -118,6 +118,8 @@ pub struct Renderer {
     textures: HashMap<(String, u32), Arc<TexEntry>>,
     /// 動画フレームのキャッシュキー（古い順）
     video_keys: std::collections::VecDeque<(String, u32)>,
+    /// テキスト画像ごとの位置合わせ点（揃え）。`textures` のテキストキーと対応する
+    text_anchors: HashMap<(String, u32), [f32; 2]>,
 }
 
 fn uniform_entry(visibility: wgpu::ShaderStages, size: usize) -> wgpu::BindGroupLayoutEntry {
@@ -306,12 +308,14 @@ impl Renderer {
             targets: None,
             textures: HashMap::new(),
             video_keys: std::collections::VecDeque::new(),
+            text_anchors: HashMap::new(),
         }
     }
 
     /// テキスト描画に使うフォント（`.ttf` / `.otf` / `.ttc`）を設定します。
     pub fn set_font(&mut self, bytes: Vec<u8>, index: u32) -> bool {
         self.textures.retain(|(k, _), _| !k.starts_with(TEXT_KEY_PREFIX));
+        self.text_anchors.clear();
         self.font = crate::text::load_font(bytes, index);
         self.font.is_some()
     }
@@ -844,22 +848,71 @@ impl Renderer {
                 }
             }
             EffectKind::Text => {
+                use crate::text::{Decoration, TextStyle};
                 let size = (src.eval("サイズ", rel, 34.0) as f32 * p.zoom).max(1.0);
                 let color_hex = src.text("color").unwrap_or("ffffff");
-                let [cr, cg, cb] = parse_hex_color(color_hex).unwrap_or([1.0, 1.0, 1.0]);
+                let color2_hex = src.text("color2").unwrap_or("000000");
+                let to_u8 = |c: [f32; 3]| [(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8];
+                let rgb = to_u8(parse_hex_color(color_hex).unwrap_or([1.0, 1.0, 1.0]));
+                let rgb2 = to_u8(parse_hex_color(color2_hex).unwrap_or([0.0, 0.0, 0.0]));
                 let body = src.text("text").unwrap_or_default().replace("\r\n", "\n");
-                let key = (format!("{TEXT_KEY_PREFIX}{size:.1}\0{color_hex}\0{body}"), 0);
-                let entry = match self.textures.get(&key) {
-                    Some(t) => t.clone(),
-                    None => {
-                        let rgb = [(cr * 255.0).round() as u8, (cg * 255.0).round() as u8, (cb * 255.0).round() as u8];
-                        let bitmap = crate::text::rasterize(self.font.as_ref()?, &body, size, rgb)?;
-                        self.media_texture(key, &bitmap, false)?
+                let int = |k: &str| src.text(k).and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0);
+                let font_name = src.text("font").unwrap_or("").trim().to_string();
+                // 表示速度（文字/秒）: 0 = すべて表示。表示する文字数は全文字数で頭打ち（キャッシュキーが増え続けないように）
+                let total = crate::text::char_count(&body);
+                let visible = crate::text::visible_chars_at(src.eval("表示速度", rel, 0.0), rel, fps).map(|n| n.min(total));
+                let style = TextStyle {
+                    color2: rgb2,
+                    bold: src.eval("B", rel, 0.0) >= 0.5,
+                    italic: src.eval("I", rel, 0.0) >= 0.5,
+                    decoration: Decoration::from_type(int("type")),
+                    spacing_x: src.text("spacing_x").and_then(|t| t.trim().parse::<f32>().ok()).unwrap_or(0.0) * p.zoom,
+                    spacing_y: src.text("spacing_y").and_then(|t| t.trim().parse::<f32>().ok()).unwrap_or(0.0) * p.zoom,
+                    monospace: int("monospace") != 0,
+                    align: int("align").min(8),
+                    visible_chars: visible,
+                    ..TextStyle::new(size, rgb)
+                };
+                // 画像の内容が変わるものはすべてキーに含める（フォント名も: 同じ名前は同じフォントに解決される）
+                let key = (
+                    format!(
+                        "{TEXT_KEY_PREFIX}{:.1}\0{color_hex}\0{color2_hex}\0{}{}{}{}{}\0{:.1}\0{:.1}\0{}\0{font_name}\0{body}",
+                        style.px,
+                        style.bold as u8,
+                        style.italic as u8,
+                        style.monospace as u8,
+                        int("type"),
+                        style.align,
+                        style.spacing_x,
+                        style.spacing_y,
+                        visible.map_or(-1, |n| n as i64),
+                    ),
+                    0,
+                );
+                // 位置合わせ点はキャッシュ済みの画像から求め直せないので、画像と一緒に覚えておく
+                let (entry, anchor) = match (self.textures.get(&key), self.text_anchors.get(&key)) {
+                    (Some(t), Some(a)) => (t.clone(), *a),
+                    _ => {
+                        let named = if font_name.is_empty() { None } else { crate::text::resolve_font(&font_name) };
+                        let font: &ab_glyph::FontVec = match named.as_deref() {
+                            Some(f) => f,
+                            None => self.font.as_ref()?,
+                        };
+                        let bitmap = crate::text::rasterize(font, &body, &style)?;
+                        let entry = self.media_texture(key.clone(), &bitmap.frame, false)?;
+                        if self.text_anchors.len() >= 256 {
+                            self.text_anchors.clear();
+                        }
+                        self.text_anchors.insert(key, bitmap.anchor);
+                        (entry, bitmap.anchor)
                     }
                 };
                 let (w, h) = entry.size;
-                // 画像は拡大率をラスタライズ時に反映済みなので、スプライトは等倍で置く
-                Some((SpriteUniform { mode: 0, half: [w as f32 / 2.0, h as f32 / 2.0], ..base }, Some(entry)))
+                // 画像は拡大率をラスタライズ時に反映済みなので、スプライトは等倍で置く。
+                // 揃えの位置合わせ点がオブジェクトの位置に来るよう、回転に合わせて中心をずらす
+                let (s, c) = p.angle.sin_cos();
+                let center = [p.x - (anchor[0] * c - anchor[1] * s), p.y - (anchor[0] * s + anchor[1] * c)];
+                Some((SpriteUniform { mode: 0, center, half: [w as f32 / 2.0, h as f32 / 2.0], ..base }, Some(entry)))
             }
             // それ以外の種類は未対応（docs/RENDER_DESIGN.md 参照）
             _ => None,
