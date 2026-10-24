@@ -1,3 +1,4 @@
+// スプライト描画の共通部分（構造体・バインディング・SDF の補助関数）。sprite_vertex / sprite_fragment と連結して使う。
 // スプライト描画: 1 オブジェクト = 1 クワッド。
 // mode 0: テクスチャ（画像・動画フレーム） / mode 1: SDF 図形（解析的アンチエイリアス）
 //
@@ -17,6 +18,11 @@ struct Draw {
     shape: u32,
     sides: u32,
     _pad: u32,
+    // --- 以下は段階 B の予約領域（所有者ごとに分けて、編集の衝突を避ける）---
+    // ext: 拡張描画・3D・カメラ（頂点シェーダ側が使う）。Rust 側 `SpriteUniform::ext` と同じ並び
+    ext: array<vec4<f32>, 4>,
+    // blend: 合成モード・クリッピング（フラグメントシェーダ側が使う）。Rust 側 `SpriteUniform::blend` と同じ並び
+    blend: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> d: Draw;
@@ -26,28 +32,6 @@ struct Draw {
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) local: vec2<f32>,
-}
-
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> VsOut {
-    var corners = array<vec2<f32>, 4>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(1.0, -1.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(1.0, 1.0),
-    );
-    // アンチエイリアスのために 1px 外側へ広げる
-    let ext = d.half + vec2<f32>(1.0, 1.0);
-    let local = corners[i] * ext;
-    let s = sin(d.angle);
-    let c = cos(d.angle);
-    // y 下向き座標での正の回転 = 画面上で時計回り（AviUtl の回転方向）
-    let rotated = vec2<f32>(local.x * c - local.y * s, local.x * s + local.y * c);
-    let p = d.center + rotated;
-    var out: VsOut;
-    out.pos = vec4<f32>(p.x / (d.canvas.x * 0.5), -p.y / (d.canvas.y * 0.5), 0.0, 1.0);
-    out.local = local;
-    return out;
 }
 
 fn sd_box(p: vec2<f32>, h: vec2<f32>) -> f32 {
@@ -93,22 +77,3 @@ fn sd_star(p: vec2<f32>, r: f32) -> f32 {
     return select(dist, -dist, inside);
 }
 
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let l = in.local;
-    if d.mode == 0u {
-        let cov = clamp(0.5 - sd_box(l, d.half), 0.0, 1.0);
-        let uv = l / (2.0 * d.half) + vec2<f32>(0.5, 0.5);
-        let t = textureSampleLevel(tex, samp, uv, 0.0);
-        return vec4<f32>(t.rgb, t.a * cov * d.alpha);
-    }
-    var sd = 0.0;
-    switch d.shape {
-        case 0u: { sd = length(l) - d.half.x; }
-        case 1u: { sd = sd_box(l, d.half); }
-        case 2u: { sd = sd_polygon(l, d.half.x, d.sides); }
-        default: { sd = sd_star(l, d.half.x); }
-    }
-    let cov = clamp(0.5 - sd, 0.0, 1.0);
-    return vec4<f32>(d.color.rgb, cov * d.alpha);
-}

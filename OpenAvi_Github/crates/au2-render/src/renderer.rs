@@ -47,6 +47,10 @@ struct SpriteUniform {
     shape: u32,
     sides: u32,
     _pad: u32,
+    /// 拡張描画・3D・カメラ用の予約領域（頂点シェーダが使う。段階 B の「拡張描画/カメラ」担当が所有）
+    ext: [f32; 16],
+    /// 合成モード・クリッピング用の予約領域（フラグメントシェーダが使う。段階 B の「合成/クリッピング」担当が所有）
+    blend: [u32; 4],
 }
 
 #[repr(C)]
@@ -173,7 +177,14 @@ impl Renderer {
         });
         let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sprite.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sprite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("shaders/sprite_common.wgsl"),
+                    include_str!("shaders/sprite_vertex.wgsl"),
+                    include_str!("shaders/sprite_fragment.wgsl")
+                )
+                .into(),
+            ),
         });
         let sprite_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sprite pipeline layout"),
@@ -752,6 +763,8 @@ impl Renderer {
             shape: SHAPE_BOX,
             sides: 0,
             _pad: 0,
+            ext: [0.0; 16],
+            blend: [0; 4],
         };
         match src.kind {
             EffectKind::Shape => {
