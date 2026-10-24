@@ -332,6 +332,123 @@ fn text_is_drawn_when_a_font_is_available() {
     assert!(r.render(&s, 0, &mut NoMedia).unwrap().pixels.chunks(4).all(|p| p == [0, 0, 0, 255]));
 }
 
+fn set_text_param(obj: &mut TimelineObject, key: &str, value: &str) {
+    let eff = obj.effects.iter_mut().find(|e| e.name == "テキスト").expect("effect");
+    *eff.param_mut(key).expect("param") = au2_core::ParamValue::Text(value.to_string());
+}
+
+/// 文字（`text` 引数の見た目）を描いたフレームを返す。フォントが無ければ `None`。
+fn render_text(r: &mut Renderer, w: u32, h: u32, frame: u32, edit: impl FnOnce(&mut TimelineObject)) -> Option<RgbaFrame> {
+    // フォントは呼び出し側が一度だけ設定する（設定し直すとテキストのキャッシュが消え、キャッシュキーの検査にならない）
+    let mut s = scene(w, h);
+    let mut t = TimelineObject::new_text(0, 59, "O");
+    set_track(&mut t, "テキスト", "サイズ", 60.0);
+    edit(&mut t);
+    s.insert_object(0, t);
+    Some(r.render(&s, frame, &mut NoMedia).unwrap())
+}
+
+/// GPU があり、日本語フォントも見つかったときだけ `Some`。
+fn text_renderer() -> Option<Renderer> {
+    let mut r = renderer()?;
+    if r.load_system_font().is_none() {
+        eprintln!("日本語フォントが無いためスキップします");
+        return None;
+    }
+    Some(r)
+}
+
+fn count_color(f: &RgbaFrame, pred: impl Fn(&[u8]) -> bool) -> usize {
+    f.pixels.chunks(4).filter(|p| pred(p)).count()
+}
+
+#[test]
+fn text_decoration_draws_color2() {
+    let Some(mut r) = text_renderer() else { return };
+    let red = |p: &[u8]| p[0] > 200 && p[1] < 60 && p[2] < 60;
+    let mut counts = Vec::new();
+    for ty in ["0", "1", "2", "3", "4"] {
+        let Some(f) = render_text(&mut r, 200, 100, 0, |t| {
+            set_text_param(t, "type", ty);
+            set_text_param(t, "color2", "ff0000");
+        }) else {
+            eprintln!("日本語フォントが無いためスキップします");
+            return;
+        };
+        counts.push(count_color(&f, red));
+    }
+    assert_eq!(counts[0], 0, "標準文字に color2 が出ている");
+    assert!(counts[1] > 20 && counts[3] > 20 && counts[4] > 20, "{counts:?}");
+    // 薄い影は半透明なので、純粋な赤の画素は濃い影より少ない
+    assert!(counts[2] < counts[1], "{counts:?}");
+}
+
+#[test]
+fn text_align_and_spacing_move_pixels() {
+    let Some(mut r) = text_renderer() else { return };
+    let centroid_x = |f: &RgbaFrame| {
+        let (mut s, mut n) = (0.0, 0.0);
+        for (i, p) in f.pixels.chunks(4).enumerate() {
+            if p[0] > 128 {
+                s += (i as u32 % f.width) as f64;
+                n += 1.0;
+            }
+        }
+        s / n
+    };
+    let Some(left) = render_text(&mut r, 200, 100, 0, |t| set_text_param(t, "align", "3")) else { return };
+    let centre = render_text(&mut r, 200, 100, 0, |t| set_text_param(t, "align", "4")).unwrap();
+    let right = render_text(&mut r, 200, 100, 0, |t| set_text_param(t, "align", "5")).unwrap();
+    // 左揃え = 位置（画面中央）が文字の左端 → 文字は中央より右、右揃えは左
+    assert!(centroid_x(&left) > centroid_x(&centre) + 10.0);
+    assert!(centroid_x(&right) < centroid_x(&centre) - 10.0);
+    assert!((centroid_x(&centre) - 100.0).abs() < 3.0);
+    let top = render_text(&mut r, 200, 100, 0, |t| set_text_param(t, "align", "1")).unwrap();
+    let lit_rows = |f: &RgbaFrame| (0..f.height).filter(|y| (0..f.width).any(|x| px(f, x, *y)[0] > 128)).collect::<Vec<_>>();
+    // 上揃え = 位置（画面中央）がブロックの上端 → 文字は中央より下
+    assert!(*lit_rows(&top).first().unwrap() >= 48);
+
+    // 文字間隔: "OO" の 2 文字の距離が広がる
+    let mut two = |sp: &str| {
+        render_text(&mut r, 300, 100, 0, |t| {
+            set_text_param(t, "text", "OO");
+            set_text_param(t, "spacing_x", sp);
+        })
+        .unwrap()
+    };
+    let width = |f: &RgbaFrame| {
+        let cols: Vec<u32> = (0..f.width).filter(|x| (0..f.height).any(|y| px(f, *x, y)[0] > 128)).collect();
+        cols.last().unwrap() - cols.first().unwrap()
+    };
+    let (a, b) = (two("0"), two("30"));
+    assert!(width(&b) >= width(&a) + 28, "{} {}", width(&a), width(&b));
+}
+
+#[test]
+fn text_typewriter_reveals_over_time() {
+    let Some(mut r) = text_renderer() else { return };
+    let lit = |f: &RgbaFrame| count_color(f, |p| p[0] > 128);
+    let edit = |t: &mut TimelineObject| {
+        set_text_param(t, "text", "OOOO");
+        set_track(t, "テキスト", "表示速度", 10.0); // 10 文字/秒 @ 30fps = 3 フレームに 1 文字
+    };
+    let Some(f0) = render_text(&mut r, 300, 100, 0, edit) else { return };
+    assert_eq!(lit(&f0), 0, "0 フレーム目は何も表示されない");
+    let f1 = render_text(&mut r, 300, 100, 3, edit).unwrap();
+    let f2 = render_text(&mut r, 300, 100, 6, edit).unwrap();
+    let f4 = render_text(&mut r, 300, 100, 12, edit).unwrap();
+    let f9 = render_text(&mut r, 300, 100, 40, edit).unwrap();
+    assert!(lit(&f1) > 50 && lit(&f2) > lit(&f1) * 3 / 2 && lit(&f4) > lit(&f2) * 3 / 2, "{} {} {}", lit(&f1), lit(&f2), lit(&f4));
+    assert_eq!(lit(&f4), lit(&f9), "全文字が出た後は変わらない");
+}
+
+#[test]
+fn text_font_name_falls_back_to_default() {
+    let Some(mut r) = text_renderer() else { return };
+    let Some(f) = render_text(&mut r, 200, 100, 0, |t| set_text_param(t, "font", "No Such Font 12345")) else { return };
+    assert!(count_color(&f, |p| p[0] > 200) > 50, "存在しないフォント名でも既定フォントで描く");
+}
+
 #[test]
 fn object_bounds_follow_position_zoom_and_rotation() {
     let Some(mut r) = renderer() else { return };
