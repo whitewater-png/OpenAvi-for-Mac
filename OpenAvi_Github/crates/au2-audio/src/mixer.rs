@@ -66,7 +66,13 @@ impl AudioCache {
 /// モノラル音源には、両チャンネルへ等レベルで複製するフィルタを返します。
 /// ffmpeg 既定のモノラル → ステレオ変換は -3dB になり、AviUtl より小さく鳴ってしまうため。
 fn mono_filter(ffmpeg: &Path, path: &Path) -> Vec<&'static str> {
-    let info = Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let info = cmd
         .args(["-hide_banner", "-i"])
         .arg(path)
         .stdin(Stdio::null())
