@@ -15,6 +15,7 @@
 //! # }
 //! ```
 
+mod blend;
 mod eval;
 mod gpu;
 mod media;
@@ -22,7 +23,8 @@ mod renderer;
 mod text;
 
 pub use au2_media::RgbaFrame;
-pub use eval::{eval_draw_params, DrawParams};
+pub use blend::BlendMode;
+pub use eval::{eval_draw_params, Controls, DrawParams, GroupTransform, Homography, View};
 pub use gpu::Gpu;
 pub use media::{MediaSource, NoMedia};
 pub use renderer::{ObjectBounds, Renderer, FORMAT};
@@ -37,4 +39,6 @@ pub enum RenderError {
     SceneTooLarge { width: u32, height: u32, max: u32 },
     #[error("フレームの読み戻しに失敗しました: {0}")]
     Readback(String),
+    #[error("プロジェクトに {0} 番目のシーンがありません")]
+    NoSuchScene(usize),
 }

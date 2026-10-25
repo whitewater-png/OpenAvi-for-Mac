@@ -9,10 +9,15 @@ use au2_media::RgbaFrame;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::eval::{eval_draw_params, DrawParams};
+use crate::blend::{self, BlendMode};
+use crate::eval::{eval_draw_params, Controls, DrawParams, Homography};
+pub use crate::eval::ObjectBounds;
 use crate::gpu::Gpu;
 use crate::media::MediaSource;
 use crate::RenderError;
+
+mod nested;
+use nested::{PrevSprite, SceneCtx};
 
 /// フレームバッファのフォーマット。ガンマ空間のまま扱う（AviUtl と同じく sRGB 変換をしない）。
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -29,6 +34,9 @@ const SHAPE_CIRCLE: u32 = 0;
 const SHAPE_BOX: u32 = 1;
 const SHAPE_POLYGON: u32 = 2;
 const SHAPE_STAR: u32 = 3;
+
+/// クリッピングのマスク（上のオブジェクトの不透明度）のフォーマット。
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// 欠落メディアのプレースホルダ色（プレビューと同じ）。
 const PLACEHOLDER_COLOR: [f32; 3] = [60.0 / 255.0, 70.0 / 255.0, 90.0 / 255.0];
@@ -47,7 +55,8 @@ struct SpriteUniform {
     shape: u32,
     sides: u32,
     _pad: u32,
-    /// 拡張描画・3D・カメラ用の予約領域（頂点シェーダが使う。段階 B の「拡張描画/カメラ」担当が所有）
+    /// 拡張描画・3D・カメラ: 物体ローカル座標 → 画面座標の射影変換（頂点シェーダが使う）。
+    /// 並びは `eval::Homography::to_ext`。全て 0 なら `center` / `angle` による 2D 配置
     ext: [f32; 16],
     /// 合成モード・クリッピング用の予約領域（フラグメントシェーダが使う。段階 B の「合成/クリッピング」担当が所有）
     blend: [u32; 4],
@@ -62,16 +71,6 @@ struct ColorCorrectionUniform {
     b: [f32; 4],
 }
 
-/// 直近の描画での、オブジェクトの描画範囲（回転した矩形）。選択枠などの UI 用。
-/// 座標はシーン中心基準のピクセル（+y 下）、`half` は回転前の半サイズ。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ObjectBounds {
-    pub center: [f32; 2],
-    pub half: [f32; 2],
-    /// ラジアン（正 = 時計回り）
-    pub angle: f32,
-}
-
 struct TexEntry {
     size: (u32, u32),
     _texture: wgpu::Texture,
@@ -79,8 +78,22 @@ struct TexEntry {
 }
 
 enum Op {
-    Sprite { offset: u32, tex: Option<Arc<TexEntry>> },
+    Sprite { offset: u32, tex: Option<Arc<TexEntry>>, path: SpritePath },
+    /// クリッピング元（上のオブジェクト）の不透明度をマスクへ描く。直後の `SpritePath::Ext` のスプライトが読む
+    ClipMask { offset: u32, tex: Option<Arc<TexEntry>> },
     ColorCorrection { offset: u32 },
+    /// フレームバッファオブジェクト: ここまでの合成結果を `tex` に写し取る（`clear` なら写した後に背景で塗り直す）
+    Snapshot { tex: Arc<TexEntry>, clear: bool },
+}
+
+/// スプライトの描画経路。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpritePath {
+    /// 通常合成・クリッピング無し: 連続する分を 1 パスにまとめて描く
+    Fast,
+    /// 合成モード ≠ 通常、またはクリッピングあり: 1 スプライト 1 パス（`fs_ext`）。
+    /// `reads_dst` なら描く直前にフレームバッファを scratch へ写し、下地としてシェーダで読む
+    Ext { reads_dst: bool },
 }
 
 struct Targets {
@@ -93,9 +106,13 @@ struct Targets {
     /// テクスチャ間コピーが未定義動作になるため、この経路は使わない）。
     display: Option<wgpu::Texture>,
     display_view: wgpu::TextureView,
-    /// フィルタパスが読む用のコピー先（ping-pong 相手）
+    /// フィルタパス・合成モードが読む用のコピー先（ping-pong 相手）
     scratch: wgpu::Texture,
     scratch_bind_group: wgpu::BindGroup,
+    /// クリッピングのマスク（`MASK_FORMAT`）
+    mask_view: wgpu::TextureView,
+    /// `fs_ext` のグループ 2（scratch = 下地、mask）
+    sprite_ext_bind_group: wgpu::BindGroup,
     /// 読み戻し用バッファ。プレビューは読み戻さないので、最初の `render()` まで作らない
     readback: Option<wgpu::Buffer>,
     padded_row: u32,
@@ -104,6 +121,11 @@ struct Targets {
 pub struct Renderer {
     gpu: Gpu,
     sprite_pipeline: wgpu::RenderPipeline,
+    /// 合成モード・クリッピング用（`fs_ext`）
+    sprite_ext_pipeline: wgpu::RenderPipeline,
+    /// クリッピングのマスク描画用（`fs_mask`）
+    mask_pipeline: wgpu::RenderPipeline,
+    sprite_ext_layout: wgpu::BindGroupLayout,
     sprite_uniform_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -118,6 +140,14 @@ pub struct Renderer {
     textures: HashMap<(String, u32), Arc<TexEntry>>,
     /// 動画フレームのキャッシュキー（古い順）
     video_keys: std::collections::VecDeque<(String, u32)>,
+    /// テキスト画像ごとの位置合わせ点（揃え）。`textures` のテキストキーと対応する
+    text_anchors: HashMap<(String, u32), [f32; 2]>,
+    /// シーンオブジェクトの子シーンを描く作業用フレームバッファ（入れ子の深さごと）
+    nested_targets: HashMap<usize, Targets>,
+    /// シーンオブジェクトごとの、子シーンの描画結果
+    scene_textures: HashMap<ObjectId, Arc<TexEntry>>,
+    /// フレームバッファオブジェクトが写し取る先（サイズごと）
+    snapshots: HashMap<(u32, u32), Arc<TexEntry>>,
 }
 
 fn uniform_entry(visibility: wgpu::ShaderStages, size: usize) -> wgpu::BindGroupLayoutEntry {
@@ -228,6 +258,60 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // --- 合成モード・クリッピング（fs_ext / fs_mask）: グループ 2 に下地（scratch）とマスクを足す ---
+        let unfilterable = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sprite_ext_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sprite dst/mask"),
+            entries: &[unfilterable(0), unfilterable(1)],
+        });
+        let sprite_ext_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sprite ext pipeline layout"),
+            bind_group_layouts: &[&sprite_uniform_layout, &texture_layout, &sprite_ext_layout],
+            push_constant_ranges: &[],
+        });
+        let sprite_variant = |label: &str,
+                              layout: &wgpu::PipelineLayout,
+                              entry_point: &str,
+                              format: wgpu::TextureFormat,
+                              blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &sprite_shader,
+                    entry_point: "vs",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &sprite_shader,
+                    entry_point,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        // 合成モードの式はシェーダで計算し、上の不透明度での混ぜ合わせは通常と同じ「over」に任せる
+        let sprite_ext_pipeline =
+            sprite_variant("sprite ext pipeline", &sprite_ext_pipeline_layout, "fs_ext", FORMAT, Some(over));
+        // マスクは毎回 0 で消してから 1 オブジェクトだけ描くので、ブレンド無しで上書きする
+        let mask_pipeline = sprite_variant("clip mask pipeline", &sprite_pipeline_layout, "fs_mask", MASK_FORMAT, None);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("sprite sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -293,6 +377,9 @@ impl Renderer {
         Self {
             gpu,
             sprite_pipeline,
+            sprite_ext_pipeline,
+            mask_pipeline,
+            sprite_ext_layout,
             sprite_uniform_layout,
             texture_layout,
             sampler,
@@ -306,12 +393,17 @@ impl Renderer {
             targets: None,
             textures: HashMap::new(),
             video_keys: std::collections::VecDeque::new(),
+            text_anchors: HashMap::new(),
+            nested_targets: HashMap::new(),
+            scene_textures: HashMap::new(),
+            snapshots: HashMap::new(),
         }
     }
 
     /// テキスト描画に使うフォント（`.ttf` / `.otf` / `.ttc`）を設定します。
     pub fn set_font(&mut self, bytes: Vec<u8>, index: u32) -> bool {
         self.textures.retain(|(k, _), _| !k.starts_with(TEXT_KEY_PREFIX));
+        self.text_anchors.clear();
         self.font = crate::text::load_font(bytes, index);
         self.font.is_some()
     }
@@ -441,9 +533,37 @@ impl Renderer {
             layout: &self.filter_src_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) }],
         });
+        let mask = make(
+            "clip mask",
+            MASK_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            &[],
+        );
+        let mask_view = mask.create_view(&wgpu::TextureViewDescriptor::default());
+        let sprite_ext_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sprite dst/mask bind group"),
+            layout: &self.sprite_ext_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view) },
+            ],
+        });
         let padded_row = align_up(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         self.generation += 1;
-        self.targets = Some(Targets { width, height, main, main_view, display, display_view, scratch, scratch_bind_group, readback: None, padded_row });
+        self.targets = Some(Targets {
+            width,
+            height,
+            main,
+            main_view,
+            display,
+            display_view,
+            scratch,
+            scratch_bind_group,
+            mask_view,
+            sprite_ext_bind_group,
+            readback: None,
+            padded_row,
+        });
         Ok(())
     }
 
@@ -491,6 +611,17 @@ impl Renderer {
         frame: Frame,
         media: &mut dyn MediaSource,
     ) -> Result<(), RenderError> {
+        self.render_scene(scene, frame, media, &SceneCtx::root(&[], None))
+    }
+
+    /// `ctx` の下で `scene` を `self.targets` に描きます（シーンオブジェクトの子シーンでも使う）。
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        frame: Frame,
+        media: &mut dyn MediaSource,
+        ctx: &SceneCtx<'_>,
+    ) -> Result<(), RenderError> {
         let width = scene.settings.width.max(1);
         let height = scene.settings.height.max(1);
         self.ensure_targets(width, height)?;
@@ -506,28 +637,86 @@ impl Renderer {
         let canvas = [width as f32, height as f32];
         let fps = scene.settings.frame_rate.as_f64();
         self.bounds.clear();
+        // 上のオブジェクトでクリッピング: クリッピング元は自分の順番では描かず、すぐ下のオブジェクトのマスクになる
+        let mut clip_source: Option<(usize, SpriteUniform, Option<Arc<TexEntry>>)> = None;
+        // グループ制御・カメラ制御（レイヤー順に登録し、下のオブジェクトに掛ける）
+        let mut controls = Controls::new(canvas[1]);
+        // 直前オブジェクト用: 直前に描いたスプライト
+        let mut prev: Option<PrevSprite> = None;
 
-        for (li, obj) in scene.objects_at(frame) {
+        // クリッピング元の判定にも、下の行が見ている（時間制御後の）フレームを使う
+        let frames = au2_core::scene_time::layer_frames(scene, frame);
+        for (li, obj, layer_frame) in au2_core::scene_time::objects_at_remapped(scene, frame) {
             if !scene.layers[li].visible {
                 continue;
             }
             let Some(src) = obj.source().filter(|s| s.enabled) else { continue };
-            let rel = frame - obj.frame_start;
+            // 時間制御の下では、置き換え後の時刻での相対フレーム
+            let rel = layer_frame - obj.frame_start;
             match obj.category() {
                 ObjectCategory::Media => {
-                    let params = eval_draw_params(obj, rel, fps);
+                    if src.kind == EffectKind::FrameBuffer {
+                        let clear = src.eval("フレームバッファをクリア", rel, 0.0) >= 0.5;
+                        ops.push(Op::Snapshot { tex: self.snapshot_texture(width, height), clear });
+                    }
+                    let params = controls.apply(li, obj, eval_draw_params(obj, rel, fps));
                     if params.alpha <= 0.0 {
                         continue;
                     }
-                    if let Some((uniform, tex)) = self.sprite_for(obj, rel, fps, canvas, params, media) {
-                        self.bounds.insert(
-                            obj.id,
-                            ObjectBounds { center: uniform.center, half: uniform.half, angle: uniform.angle },
-                        );
-                        let offset = sprite_bytes.len() as u32;
-                        sprite_bytes.extend_from_slice(bytemuck::bytes_of(&uniform));
-                        sprite_bytes.resize((offset + sprite_stride) as usize, 0);
-                        ops.push(Op::Sprite { offset, tex });
+                    let sprite = match src.kind {
+                        EffectKind::Scene => self.scene_sprite(obj, rel, fps, canvas, params, media, ctx),
+                        EffectKind::FrameBuffer => {
+                            Some(nested::framebuffer_sprite(canvas, params, self.snapshot_texture(width, height)))
+                        }
+                        EffectKind::PreviousObject => prev.as_ref().map(|p| p.redraw(params)),
+                        _ => self.sprite_for(obj, rel, fps, canvas, params, media),
+                    };
+                    if let Some((mut uniform, tex)) = sprite {
+                        // シーン・フレームバッファ・直前オブジェクトのスプライトも、3D 配置（グループ・カメラ込み）にする
+                        if matches!(src.kind, EffectKind::Scene | EffectKind::FrameBuffer | EffectKind::PreviousObject) {
+                            uniform.ext = params.homography().to_ext();
+                        }
+                        prev = Some(PrevSprite { uniform, tex: tex.clone(), zoom: params.zoom });
+                        // --- 合成モード・クリッピング（docs/RENDER_DESIGN.md「合成モード・クリッピング」）---
+                        uniform.blend = [BlendMode::of_object(obj).code(), 0, 0, 0];
+                        let is_source = blend::is_clip_source(scene, li, frames.get(li + 1).copied().unwrap_or(frame));
+                        let mut mask = None;
+                        if !is_source && blend::clips_to_upper(scene, li, obj) {
+                            // すぐ上のレイヤーにマスクになるオブジェクトが無ければ描かない
+                            let Some((_, mask_uniform, mask_tex)) = clip_source.take().filter(|(sl, ..)| sl + 1 == li)
+                            else {
+                                continue;
+                            };
+                            mask = Some((mask_uniform, mask_tex));
+                            uniform.blend[1] = 1;
+                        }
+                        // 裏面（裏面を表示しない）と、丸ごとカメラの後ろにあるものは描かない
+                        let h = Homography::from_ext(&uniform.ext)
+                            .unwrap_or_else(|| Homography::flat(uniform.center, uniform.angle));
+                        if (params.cull_back && h.is_back_facing()) || h.is_behind_camera(uniform.half) {
+                            continue;
+                        }
+                        if let Some(b) = ObjectBounds::project(&h, uniform.half) {
+                            self.bounds.insert(obj.id, b);
+                        }
+                        if is_source {
+                            clip_source = Some((li, uniform, tex));
+                            continue;
+                        }
+                        let mut push_uniform = |u: &SpriteUniform| {
+                            let offset = sprite_bytes.len() as u32;
+                            sprite_bytes.extend_from_slice(bytemuck::bytes_of(u));
+                            sprite_bytes.resize((offset + sprite_stride) as usize, 0);
+                            offset
+                        };
+                        if let Some((mask_uniform, mask_tex)) = mask {
+                            ops.push(Op::ClipMask { offset: push_uniform(&mask_uniform), tex: mask_tex });
+                        }
+                        let path = match uniform.blend {
+                            [0, 0, ..] => SpritePath::Fast,
+                            [mode, ..] => SpritePath::Ext { reads_dst: mode != 0 },
+                        };
+                        ops.push(Op::Sprite { offset: push_uniform(&uniform), tex, path });
                     }
                 }
                 ObjectCategory::Filter if src.name == "色調補正" => {
@@ -548,6 +737,7 @@ impl Renderer {
                     filter_bytes.resize((offset + filter_stride) as usize, 0);
                     ops.push(Op::ColorCorrection { offset });
                 }
+                ObjectCategory::Control => controls.observe(li, obj, rel),
                 _ => {}
             }
         }
@@ -592,20 +782,43 @@ impl Renderer {
             ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
         };
 
-        // 背景は不透明な黒
+        // 背景（ルートは不透明な黒、シーンオブジェクトの子シーンは透明）
         drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear"),
-            color_attachments: &[Some(color_attachment(wgpu::LoadOp::Clear(wgpu::Color::BLACK)))],
+            color_attachments: &[Some(color_attachment(wgpu::LoadOp::Clear(ctx.background)))],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
         }));
 
+        // 現在の合成結果を scratch にコピーする（フィルタ・合成モードが下地として読む）
+        let copy_to_scratch = |encoder: &mut wgpu::CommandEncoder| {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &targets.main,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &targets.scratch,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        };
+        let dummy = &self.dummy_texture;
+        fn texture_bg<'a>(tex: &'a Option<Arc<TexEntry>>, dummy: &'a Arc<TexEntry>) -> &'a wgpu::BindGroup {
+            &tex.as_ref().unwrap_or(dummy).bind_group
+        }
+
         let mut i = 0;
         while i < ops.len() {
             match &ops[i] {
-                Op::Sprite { .. } => {
-                    // 連続するスプライトは 1 パスにまとめる
+                Op::Sprite { path: SpritePath::Fast, .. } => {
+                    // 連続する通常合成のスプライトは 1 パスにまとめる
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("sprites"),
                         color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
@@ -614,32 +827,57 @@ impl Renderer {
                         occlusion_query_set: None,
                     });
                     pass.set_pipeline(&self.sprite_pipeline);
-                    while let Some(Op::Sprite { offset, tex }) = ops.get(i) {
-                        let bind_group = &tex.as_ref().unwrap_or(&self.dummy_texture).bind_group;
+                    while let Some(Op::Sprite { offset, tex, path: SpritePath::Fast }) = ops.get(i) {
                         pass.set_bind_group(0, &sprite_bg, &[*offset]);
-                        pass.set_bind_group(1, bind_group, &[]);
+                        pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
                         pass.draw(0..4, 0..1);
                         i += 1;
                     }
                 }
+                Op::Sprite { offset, tex, path: SpritePath::Ext { reads_dst } } => {
+                    // 合成モードは下地を読むので、描く直前の合成結果を scratch に写してからパスを始める
+                    if *reads_dst {
+                        copy_to_scratch(&mut encoder);
+                    }
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("sprite (blend/clip)"),
+                        color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.sprite_ext_pipeline);
+                    pass.set_bind_group(0, &sprite_bg, &[*offset]);
+                    pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
+                    pass.set_bind_group(2, &targets.sprite_ext_bind_group, &[]);
+                    pass.draw(0..4, 0..1);
+                    i += 1;
+                }
+                Op::ClipMask { offset, tex } => {
+                    // マスクを 0 で消し、クリッピング元のオブジェクトの不透明度だけを描く
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clip mask"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.mask_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.mask_pipeline);
+                    pass.set_bind_group(0, &sprite_bg, &[*offset]);
+                    pass.set_bind_group(1, texture_bg(tex, dummy), &[]);
+                    pass.draw(0..4, 0..1);
+                    i += 1;
+                }
                 Op::ColorCorrection { offset } => {
                     // 現在の合成結果を scratch にコピーし、それを読みながら main へ書き戻す
-                    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-                    encoder.copy_texture_to_texture(
-                        wgpu::ImageCopyTexture {
-                            texture: &targets.main,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::ImageCopyTexture {
-                            texture: &targets.scratch,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        size,
-                    );
+                    copy_to_scratch(&mut encoder);
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("color correction"),
                         color_attachments: &[Some(color_attachment(wgpu::LoadOp::Load))],
@@ -651,6 +889,10 @@ impl Renderer {
                     pass.set_bind_group(0, &filter_bg, &[*offset]);
                     pass.set_bind_group(1, &targets.scratch_bind_group, &[]);
                     pass.draw(0..3, 0..1);
+                    i += 1;
+                }
+                Op::Snapshot { tex, clear } => {
+                    nested::record_snapshot(&mut encoder, targets, &tex._texture, *clear, ctx.background);
                     i += 1;
                 }
             }
@@ -685,6 +927,11 @@ impl Renderer {
         media: &mut dyn MediaSource,
     ) -> Result<RgbaFrame, RenderError> {
         self.render_to_framebuffer(scene, frame, media)?;
+        self.read_framebuffer()
+    }
+
+    /// 直近の描画結果を CPU へ読み戻します。
+    fn read_framebuffer(&mut self) -> Result<RgbaFrame, RenderError> {
         let device = &self.gpu.device;
         {
             let targets = self.targets.as_mut().expect("render_to_framebuffer で確保済み");
@@ -763,7 +1010,7 @@ impl Renderer {
             shape: SHAPE_BOX,
             sides: 0,
             _pad: 0,
-            ext: [0.0; 16],
+            ext: p.homography().to_ext(),
             blend: [0; 4],
         };
         match src.kind {
@@ -778,6 +1025,7 @@ impl Renderer {
                         u.center = [0.0, 0.0];
                         u.angle = 0.0;
                         u.half = [canvas[0] / 2.0, canvas[1] / 2.0];
+                        u.ext = [0.0; 16];
                     }
                     1 => u.shape = SHAPE_CIRCLE,
                     2 => u.shape = SHAPE_BOX,
@@ -844,22 +1092,84 @@ impl Renderer {
                 }
             }
             EffectKind::Text => {
+                use crate::text::{Decoration, TextStyle};
                 let size = (src.eval("サイズ", rel, 34.0) as f32 * p.zoom).max(1.0);
                 let color_hex = src.text("color").unwrap_or("ffffff");
-                let [cr, cg, cb] = parse_hex_color(color_hex).unwrap_or([1.0, 1.0, 1.0]);
+                let color2_hex = src.text("color2").unwrap_or("000000");
+                let to_u8 = |c: [f32; 3]| [(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8];
+                let rgb = to_u8(parse_hex_color(color_hex).unwrap_or([1.0, 1.0, 1.0]));
+                let rgb2 = to_u8(parse_hex_color(color2_hex).unwrap_or([0.0, 0.0, 0.0]));
                 let body = src.text("text").unwrap_or_default().replace("\r\n", "\n");
-                let key = (format!("{TEXT_KEY_PREFIX}{size:.1}\0{color_hex}\0{body}"), 0);
-                let entry = match self.textures.get(&key) {
-                    Some(t) => t.clone(),
-                    None => {
-                        let rgb = [(cr * 255.0).round() as u8, (cg * 255.0).round() as u8, (cb * 255.0).round() as u8];
-                        let bitmap = crate::text::rasterize(self.font.as_ref()?, &body, size, rgb)?;
-                        self.media_texture(key, &bitmap, false)?
+                let int = |k: &str| src.text(k).and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0);
+                let font_name = src.text("font").unwrap_or("").trim().to_string();
+                // 表示速度（文字/秒）: 0 = すべて表示。表示する文字数は全文字数で頭打ち（キャッシュキーが増え続けないように）
+                let total = crate::text::char_count(&body);
+                let visible = crate::text::visible_chars_at(src.eval("表示速度", rel, 0.0), rel, fps).map(|n| n.min(total));
+                let style = TextStyle {
+                    color2: rgb2,
+                    bold: src.eval("B", rel, 0.0) >= 0.5,
+                    italic: src.eval("I", rel, 0.0) >= 0.5,
+                    decoration: Decoration::from_type(int("type")),
+                    spacing_x: src.text("spacing_x").and_then(|t| t.trim().parse::<f32>().ok()).unwrap_or(0.0) * p.zoom,
+                    spacing_y: src.text("spacing_y").and_then(|t| t.trim().parse::<f32>().ok()).unwrap_or(0.0) * p.zoom,
+                    monospace: int("monospace") != 0,
+                    align: int("align").min(8),
+                    visible_chars: visible,
+                    ..TextStyle::new(size, rgb)
+                };
+                // 画像の内容が変わるものはすべてキーに含める（フォント名も: 同じ名前は同じフォントに解決される）
+                let key = (
+                    format!(
+                        "{TEXT_KEY_PREFIX}{:.1}\0{color_hex}\0{color2_hex}\0{}{}{}{}{}\0{:.1}\0{:.1}\0{}\0{font_name}\0{body}",
+                        style.px,
+                        style.bold as u8,
+                        style.italic as u8,
+                        style.monospace as u8,
+                        int("type"),
+                        style.align,
+                        style.spacing_x,
+                        style.spacing_y,
+                        visible.map_or(-1, |n| n as i64),
+                    ),
+                    0,
+                );
+                // 位置合わせ点はキャッシュ済みの画像から求め直せないので、画像と一緒に覚えておく
+                let (entry, anchor) = match (self.textures.get(&key), self.text_anchors.get(&key)) {
+                    (Some(t), Some(a)) => (t.clone(), *a),
+                    _ => {
+                        let named = if font_name.is_empty() { None } else { crate::text::resolve_font(&font_name) };
+                        let font: &ab_glyph::FontVec = match named.as_deref() {
+                            Some(f) => f,
+                            None => self.font.as_ref()?,
+                        };
+                        let bitmap = crate::text::rasterize(font, &body, &style)?;
+                        let entry = self.media_texture(key.clone(), &bitmap.frame, false)?;
+                        if self.text_anchors.len() >= 256 {
+                            self.text_anchors.clear();
+                        }
+                        self.text_anchors.insert(key, bitmap.anchor);
+                        (entry, bitmap.anchor)
                     }
                 };
                 let (w, h) = entry.size;
-                // 画像は拡大率をラスタライズ時に反映済みなので、スプライトは等倍で置く
-                Some((SpriteUniform { mode: 0, half: [w as f32 / 2.0, h as f32 / 2.0], ..base }, Some(entry)))
+                // 画像は拡大率をラスタライズ時に反映済みなので、スプライトは等倍で置く。
+                // 揃えの位置合わせ点がオブジェクトの位置に来るよう、回転に合わせて中心をずらす
+                let (s, c) = p.angle.sin_cos();
+                let center = [p.x - (anchor[0] * c - anchor[1] * s), p.y - (anchor[0] * s + anchor[1] * c)];
+                // 3D 配置（ext）でも同じ位置合わせ点がオブジェクトの位置に来るよう、回転の中心を位置合わせ点へずらす
+                // （中心は拡大前のピクセルで持つので、ラスタライズ時の拡大率で割る）
+                let zoom = p.zoom.max(1e-6);
+                let aligned = DrawParams { center: [p.center[0] + anchor[0] / zoom, p.center[1] + anchor[1] / zoom, p.center[2]], ..p };
+                Some((
+                    SpriteUniform {
+                        mode: 0,
+                        center,
+                        half: [w as f32 / 2.0, h as f32 / 2.0],
+                        ext: aligned.homography().to_ext(),
+                        ..base
+                    },
+                    Some(entry),
+                ))
             }
             // それ以外の種類は未対応（docs/RENDER_DESIGN.md 参照）
             _ => None,
